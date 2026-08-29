@@ -1,0 +1,43 @@
+# 测试环境配置：
+# - 使用独立测试库 ecommerce_test（自动创建）+ Redis DB15，不污染开发数据
+# - 禁用 Sentinel / 排除 RocketMQ 自动装配，避免依赖未启动的外部中间件
+spring:
+  datasource:
+    url: jdbc:mysql://localhost:3306/ecommerce_test?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&createDatabaseIfNotExist=true
+    username: ${MYSQL_USERNAME:root}
+    password: ${MYSQL_PASSWORD:123456}
+    hikari:
+      maximum-pool-size: 30
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      database: 15
+      timeout: 5000
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:sql/schema-test.sql
+      continue-on-error: false
+  cloud:
+    sentinel:
+      enabled: false
+  autoconfigure:
+    exclude:
+      - org.apache.rocketmq.spring.autoconfigure.RocketMQAutoConfiguration
+
+# 关闭自定义 Sentinel 规则初始化（避免依赖 Sentinel 文件日志，测试环境偶发 JUL NPE）
+ecommerce:
+  sentinel:
+    enabled: false
+  business:
+    # 并发测试环境调大锁等待，避免机器负载高时"获取锁超时"导致偶发丢单
+    inventory-lock-wait-seconds: 30
+
+# redisson-spring-boot-starter 部分版本读取 spring.redis 前缀，双写保证锁也走 DB15 隔离
+spring.redis.database: 15
+
+logging:
+  level:
+    com.ecommerce: info
+    org.redisson: warn

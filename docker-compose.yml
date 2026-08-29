@@ -1,0 +1,106 @@
+# 电商项目中间件一键启动
+# 用法：
+#   docker compose up -d                     # 仅中间件
+#   docker compose --profile app up -d --build  # 中间件 + 后端应用
+#
+# 注意：如果你本机已运行 MySQL(3306)/Redis(6379)，请先停掉本机服务或修改下方端口映射。
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: ecommerce-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: "123456"
+      MYSQL_DATABASE: ecommerce
+      TZ: Asia/Shanghai
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      # 首次启动自动执行建库建表 + 演示数据
+      - ./src/main/resources/sql/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p123456"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: ecommerce-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+
+  nacos:
+    image: nacos/nacos-server:v2.3.2
+    container_name: ecommerce-nacos
+    environment:
+      MODE: standalone
+      NACOS_AUTH_ENABLE: "false"
+      JVM_XMS: 256m
+      JVM_XMX: 256m
+    ports:
+      - "8848:8848"
+      - "9848:9848"
+
+  rocketmq-namesrv:
+    image: apache/rocketmq:5.1.4
+    container_name: ecommerce-rocketmq-namesrv
+    ports:
+      - "9876:9876"
+    command: sh mqnamesrv
+
+  rocketmq-broker:
+    image: apache/rocketmq:5.1.4
+    container_name: ecommerce-rocketmq-broker
+    ports:
+      - "10909:10909"
+      - "10911:10911"
+      - "10912:10912"
+    environment:
+      NAMESRV_ADDR: rocketmq-namesrv:9876
+    volumes:
+      - ./deploy/rocketmq/broker.conf:/home/rocketmq/rocketmq-5.1.4/conf/broker.conf:ro
+    command: sh mqbroker -n rocketmq-namesrv:9876 -c /home/rocketmq/rocketmq-5.1.4/conf/broker.conf
+    depends_on:
+      - rocketmq-namesrv
+
+  sentinel-dashboard:
+    image: bladex/sentinel-dashboard:1.8.6
+    container_name: ecommerce-sentinel-dashboard
+    ports:
+      - "8858:8858"
+
+  # 后端应用（默认不随中间件启动，使用 --profile app 启用）
+  app:
+    build: .
+    container_name: ecommerce-app
+    profiles: ["app"]
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: dev
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      MYSQL_PASSWORD: "123456"
+      ROCKETMQ_NAME_SERVER: rocketmq-namesrv:9876
+      SPRING_DATASOURCE_URL: "jdbc:mysql://mysql:3306/ecommerce?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true"
+      REDIS_HOST: redis
+      SPRING_CLOUD_NACOS_CONFIG_SERVER_ADDR: nacos:8848
+      SENTINEL_DASHBOARD: sentinel-dashboard:8858
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      nacos:
+        condition: service_started
+      rocketmq-namesrv:
+        condition: service_started
+      rocketmq-broker:
+        condition: service_started
+
+volumes:
+  mysql-data:
+  redis-data:

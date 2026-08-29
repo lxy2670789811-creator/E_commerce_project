@@ -1,0 +1,61 @@
+# ==================== 生产环境 ====================
+# 所有敏感信息必须通过环境变量注入（无默认值，缺失会导致启动失败）
+spring:
+  datasource:
+    url: ${MYSQL_URL:jdbc:mysql://localhost:3306/ecommerce?useUnicode=true&characterEncoding=utf-8&useSSL=true&serverTimezone=Asia/Shanghai}
+    username: ${MYSQL_USERNAME}
+    password: ${MYSQL_PASSWORD}
+    hikari:
+      pool-name: EcommerceHikariCP
+      minimum-idle: 10
+      maximum-pool-size: 50
+      connection-timeout: 30000
+
+  data:
+    redis:
+      host: ${REDIS_HOST}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      database: ${REDIS_DATABASE:0}
+      timeout: 3000
+      lettuce:
+        pool:
+          max-active: 50
+          max-idle: 20
+          min-idle: 5
+
+  cloud:
+    sentinel:
+      transport:
+        dashboard: ${SENTINEL_DASHBOARD}
+        port: 8719
+      eager: true
+      application-name: ${spring.application.name}
+      feign:
+        enabled: true
+
+rocketmq:
+  name-server: ${ROCKETMQ_NAME_SERVER}
+  producer:
+    group: ecommerce-producer-group
+    send-message-timeout: 3000
+    retry-times-when-send-failed: 2
+    retry-times-when-send-async-failed: 2
+
+deepseek:
+  api:
+    url: https://api.deepseek.com/v1/chat/completions
+    key: ${DEEPSEEK_API_KEY}
+    model: deepseek-chat
+    timeout-seconds: 30
+
+# 生产环境不输出 SQL 到控制台
+mybatis-plus:
+  configuration:
+    log-impl: org.apache.ibatis.logging.nologging.NoLoggingImpl
+
+logging:
+  level:
+    com.ecommerce: info
+    org.redisson: warn
+    org.apache.rocketmq: warn

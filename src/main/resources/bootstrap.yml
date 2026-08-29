@@ -1,0 +1,32 @@
+spring:
+  application:
+    name: e-commerce-order-backend
+  cloud:
+    nacos:
+      # ========== Nacos 配置中心 ==========
+      config:
+        # Nacos Server 地址
+        server-addr: 127.0.0.1:8848
+        # 命名空间（默认 public，可按环境隔离：dev/test/prod）
+        namespace: public
+        # 配置分组
+        group: ECOMMERCE_GROUP
+        # 配置文件格式：yaml
+        file-extension: yaml
+        # 配置 dataId：默认 ${spring.application.name}.${file-extension}
+        # 即：e-commerce-order-backend.yaml
+        # 共享配置（可选，多个服务共用的配置）
+        shared-configs:
+          - data-id: ecommerce-common.yaml
+            group: ECOMMERCE_GROUP
+            refresh: true
+        # 扩展配置（可选）
+        extension-configs:
+          - data-id: ecommerce-business.yaml
+            group: ECOMMERCE_GROUP
+            refresh: true
+        # 开启配置动态刷新
+        refresh-enabled: true
+        # 用户名密码（Nacos 默认）
+        username: ${NACOS_USERNAME:nacos}
+        password: ${NACOS_PASSWORD:nacos}

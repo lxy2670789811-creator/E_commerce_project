@@ -1,0 +1,10 @@
+# 测试环境 bootstrap：禁用 Nacos 配置中心，保证 @SpringBootTest 无需外部中间件即可启动
+spring:
+  application:
+    name: e-commerce-order-backend
+  cloud:
+    nacos:
+      config:
+        enabled: false
+        import-check:
+          enabled: false

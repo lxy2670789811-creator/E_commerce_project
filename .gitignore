@@ -1,0 +1,28 @@
+# ===== IDE =====
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+
+# ===== Build output =====
+target/
+frontend/dist/
+frontend/node_modules/
+
+# ===== Local env / secrets（密钥绝不提交）=====
+.env
+.env.local
+.env.*.local
+
+# ===== Logs =====
+logs/
+*.log
+derby.log
+
+# ===== 项目内本地 Maven 仓库 =====
+.m2/
+
+# ===== OS =====
+.DS_Store
+Thumbs.db

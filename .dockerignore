@@ -1,0 +1,14 @@
+target
+.m2
+.git
+.gitignore
+.idea
+.vscode
+logs
+work
+tools
+frontend/node_modules
+frontend/dist
+*.log
+.env
+derby.log

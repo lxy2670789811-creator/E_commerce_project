@@ -1,0 +1,100 @@
+# ==================== 公共配置（所有环境共享） ====================
+# 默认激活 dev 环境；生产环境启动时指定 --spring.profiles.active=prod
+spring:
+  profiles:
+    default: dev
+  application:
+    name: e-commerce-order-backend
+
+  # Jackson
+  jackson:
+    date-format: yyyy-MM-dd HH:mm:ss
+    time-zone: Asia/Shanghai
+    default-property-inclusion: non_null
+
+server:
+  port: 8080
+  servlet:
+    context-path: /api
+
+# MyBatis-Plus（环境相关的 SQL 日志在 dev/prod 中配置）
+mybatis-plus:
+  mapper-locations: classpath*:/mapper/**/*.xml
+  type-aliases-package: com.ecommerce.entity
+  configuration:
+    map-underscore-to-camel-case: true
+  global-config:
+    db-config:
+      id-type: auto
+      logic-delete-field: deleted
+      logic-delete-value: 1
+      logic-not-delete-value: 0
+
+# Knife4j / SpringDoc
+springdoc:
+  api-docs:
+    enabled: true
+    path: /v3/api-docs
+  swagger-ui:
+    enabled: true
+    path: /swagger-ui.html
+    tags-sorter: alpha
+    operations-sorter: alpha
+knife4j:
+  enable: true
+  setting:
+    language: zh_cn
+    enable-swagger-models: true
+    enable-document-manage: true
+
+# 业务配置（本地默认值，可被 Nacos 中的 ecommerce-business.yaml 动态覆盖并刷新）
+ecommerce:
+  business:
+    # --- 分布式锁 ---
+    inventory-lock-lease-seconds: 30       # 库存锁持有超时（秒）；设为-1启用看门狗自动续期
+    inventory-lock-wait-seconds: 5         # 库存锁最大等待（秒）
+    # --- AI 大模型 ---
+    ai-api-timeout-seconds: 30              # AI API 超时（秒）
+    ai-api-retry-times: 1                   # AI API 重试次数（0-3，非幂等接口不宜过大）
+    after-support-enabled: true             # 售后功能总开关
+    ai-rate-limit-max-requests: 10          # AI 限流 - 时间窗口内最大请求数
+    ai-rate-limit-time-window-seconds: 60   # AI 限流 - 时间窗口（秒）
+    # --- Sentinel 熔断兜底阈值（控制台配置优先） ---
+    order-create-qps-threshold: 100         # 下单 QPS 流控阈值
+    ai-analyze-slow-ratio-threshold: 0.6    # AI 慢调用比例熔断阈值
+    ai-analyze-min-request-amount: 5        # AI 熔断最小请求数
+    ai-analyze-stat-interval-ms: 60000      # AI 熔断统计窗口（毫秒）
+    ai-analyze-time-window: 30              # AI 熔断时长（秒）
+    deepseek-error-ratio-threshold: 0.5     # Feign 异常比例熔断阈值
+    # --- 缓存 ---
+    product-detail-expire-seconds: 3600     # 商品详情缓存过期（秒）
+    # --- 订单超时未支付自动关单（RocketMQ 延迟消息） ---
+    order-timeout-cancel-enabled: true      # 超时关单总开关
+    order-timeout-cancel-delay-level: 9     # 延迟级别（9=5分钟，详见 BusinessDynamicConfig）
+
+# DeepSeek AI 配置（密钥从环境变量读取，未设置时 AI 售后自动走"待人工审核"降级）
+deepseek:
+  api:
+    url: https://api.deepseek.com/v1/chat/completions
+    key: ${DEEPSEEK_API_KEY:}
+    model: deepseek-chat
+    timeout-seconds: 30
+
+# ==================== OpenFeign 配置 ====================
+feign:
+  # 开启 Feign 与 Sentinel 的整合（使 @FeignClient 支持熔断降级）
+  sentinel:
+    enabled: true
+  # 全局超时设置（单位：毫秒）；具体 Feign 客户端可在配置中单独覆盖
+  client:
+    config:
+      default:
+        connectTimeout: 5000
+        readTimeout: 30000
+        # Feign 日志级别：NONE/BASIC/HEADERS/FULL（调试时用 FULL）
+        loggerLevel: BASIC
+      # DeepSeek Feign 客户端单独配置超时（毫秒）
+      deepseekClient:
+        connectTimeout: 5000
+        readTimeout: 30000
+        loggerLevel: FULL
