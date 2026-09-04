@@ -11,7 +11,8 @@
 | 订单 | **三层防超卖**：Sentinel 限流 → Redisson 按商品维度分布式锁 → DB 原子扣减（`stock >= quantity`） |
 | 订单 | 完整状态机：待支付 → 已支付 → 已发货 → 已完成 / 已取消（支付回调幂等） |
 | 订单 | **RocketMQ 延迟消息超时自动关单**（事务提交后发送，消费端幂等，库存回滚） |
-| 用户 | 极简登录 + 收货地址管理（默认地址互斥） |
+| 用户 | **JWT 鉴权登录**：登录下发 Token，拦截器校验，`AuthContext`（ThreadLocal）传递身份，业务层取身份而非信任参数；收货地址管理（默认地址互斥） |
+| 订单 | **下单一次性凭证（幂等 Token）**：进入下单页 `GET /order/token` 领凭证、提交时 Lua 原子消耗（GETDEL），防双击/超时重试生成的重复订单与重复扣库存 |
 | AI 售后 | DeepSeek 大模型智能分析 + **五层保护**：动态开关 → Sentinel 熔断 → Redis 滑动窗口限流 → Feign 熔断 → 业务降级"待人工审核" |
 | 工程化 | 统一响应/全局异常、MapStruct、Knife4j 接口文档、Nacos 动态配置、多环境 profile、Docker Compose、35 个测试（含并发防超卖集成测试） |
 
@@ -23,6 +24,7 @@
 - RocketMQ（延迟消息）
 - DeepSeek 大模型 API（OpenAI 兼容协议）
 - Knife4j(SpringDoc OpenAPI)、MapStruct、Lombok、Hutool
+- **JWT 鉴权**：零第三方依赖，基于 JDK `javax.crypto` 手写 HMAC-SHA256 实现（非 Spring Security / jjwt），便于把"三段式结构 + 签名防篡改"讲透
 - 前端：Vue 3 + Vite + Element Plus（管理台演示）
 
 ## 快速开始
@@ -56,6 +58,7 @@ docker compose --profile app up -d --build
 | `MYSQL_PASSWORD` | MySQL 密码 | `123456` |
 | `NACOS_USERNAME` / `NACOS_PASSWORD` | Nacos 账号 | `nacos` / `nacos` |
 | `ROCKETMQ_NAME_SERVER` | RocketMQ NameServer | `127.0.0.1:9876` |
+| `JWT_SECRET` | JWT HMAC 签名密钥（**生产必须设置且 ≥32 字节**；不设则用仓库默认演示密钥，存在被伪造风险） | 空（用默认演示密钥，**不建议上生产**） |
 
 ### 4. 启动后端
 
@@ -131,14 +134,17 @@ java -jar app.jar --spring.profiles.active=prod
 3. **超时自动关单**：下单事务提交后发送 RocketMQ 延迟消息（延迟级别可动态配置），消费端幂等关单、回滚库存。
 4. **AI 售后降级**：动态开关 → Sentinel 慢调用/异常比例熔断 → Redis 滑动窗口限流（Lua 原子）→ Feign 熔断 → "待人工审核"兜底，AI 完全不可用时接口仍可用。
 5. **订单号唯一性**：`ORD + 秒级时间戳 + 完整雪花ID`，并发的订单号测试验证无重复。
+6. **JWT 鉴权（零依赖手写实现）**：登录签发 HMAC-SHA256 三段式 Token，`JwtAuthInterceptor` 解析后写入 `AuthContext`（ThreadLocal）传递身份，业务层取身份而非信任请求参数；请求结束 `clear()` 防线程池复用串号；`required` 开关支持兼容模式（缺 Token 放行），`allow-plain-text-login` 支持存量明文密码自动升级 BCrypt。
+7. **下单幂等凭证（防重复提交）**：`createOrder` 本身非幂等——防超卖只挡并发，挡不住时间分散的重复提交（双击/超时重发）。进入下单页 `GET /order/token` 领一次性凭证（绑定 userId+productId），提交时以 Lua 脚本原子"取出并删除"（GETDEL），二次提交因凭证已消耗被拒；Redis 故障 fail-open 放行，由数据库唯一索引 `uk_pending_unique` 兜底，两层防护相互独立。
 
 ## 项目结构
 
 ```
 src/main/java/com/ecommerce
 ├── ai          # DeepSeek 客户端、Redis 限流器
-├── common      # 统一响应、全局异常、错误码、分页、订单号生成器
-├── config      # MyBatis-Plus / Redis / Sentinel / Knife4j / 动态配置
+├── common      # 统一响应、全局异常、错误码、分页、订单号生成器、下单幂等凭证(OrderTokenService)
+├── config      # MyBatis-Plus / Redis / Sentinel / Knife4j / 动态配置 / Web MVC(注册JWT拦截器)
+├── security    # JWT 拦截器/签发校验服务/登录上下文(AuthContext)/配置属性
 ├── controller  # Product / Order / User / AI 售后
 ├── convert     # MapStruct 转换器
 ├── dto         # 请求对象
