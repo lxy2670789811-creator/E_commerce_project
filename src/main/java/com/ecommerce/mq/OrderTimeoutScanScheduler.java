@@ -29,6 +29,10 @@ import java.util.List;
  * 已被延迟消息关掉的单（状态已非待支付）会被幂等跳过，不会重复回滚库存。延迟消息与
  * 定时扫描形成"双保险"，互为兜底。
  *
+ * <p><b>MQ 健康门控（常态零查询）</b>：扫描任务仅在 RocketMQ 通道不可用时才真正查询数据库。
+ * 常态下（MQ 装配正常且最近发送成功）任务直接返回，不做任何 DB 查询，因此不引入周期轮询开销，
+ * 不违背"用定时消息规避周期扫描"的原设计意图；仅当 MQ 感知到发送失败/未装配时才接管补偿。
+ *
  * <p>开关与参数均来自 {@link BusinessDynamicConfig}（Nacos 可热更新）：
  * <ul>
  *   <li>{@code order-timeout-scan-enabled}：总开关，false 时本任务不执行；</li>
@@ -40,12 +44,13 @@ import java.util.List;
 @Slf4j
 @Component
 @RequiredArgsConstructor
-// Bean 常驻注册；是否真正执行由 order-timeout-cancel-enabled（总开关）与
-// order-timeout-scan-enabled（兜底任务专属开关）在任务内运行时判断，二者均可 Nacos 热更新。
+// Bean 常驻注册；是否真正执行由 order-timeout-cancel-enabled（总开关）、
+// order-timeout-scan-enabled（兜底任务专属开关）与 MQ 健康门控在任务内运行时判断。
 public class OrderTimeoutScanScheduler {
 
     private final OrderService orderService;
     private final BusinessDynamicConfig businessDynamicConfig;
+    private final OrderTimeoutCancelSender orderTimeoutCancelSender;
 
     /**
      * 周期扫描超时未支付订单并自动关单
@@ -64,6 +69,13 @@ public class OrderTimeoutScanScheduler {
             log.debug("定时扫描兜底开关已关闭，跳过");
             return;
         }
+        // MQ 健康门控：RocketMQ 通道可用（模板已装配且最近发送成功）时，超时关单由延迟消息主通道负责，
+        // 扫描直接返回、零 DB 查询，常态下不引入周期轮询开销。仅当 MQ 不可用时才接管补偿。
+        if (orderTimeoutCancelSender.isRocketMqUsable()) {
+            log.debug("RocketMQ 超时关单通道可用，定时扫描跳过（MQ 健康门控，避免常态周期查询）");
+            return;
+        }
+        log.info("RocketMQ 超时关单通道不可用，定时扫描接管超时订单补偿");
 
         LocalDateTime deadline = LocalDateTime.now().minusSeconds(businessDynamicConfig.getOrderTimeoutSeconds());
         List<OrderDO> expiredOrders = orderService.list(new LambdaQueryWrapper<OrderDO>()

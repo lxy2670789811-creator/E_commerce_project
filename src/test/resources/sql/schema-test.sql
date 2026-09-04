@@ -80,7 +80,9 @@ CREATE TABLE IF NOT EXISTS `orders` (
     KEY `idx_user_id` (`user_id`),
     KEY `idx_product_id` (`product_id`),
     KEY `idx_status` (`status`),
-    KEY `idx_create_time` (`create_time`)
+    KEY `idx_create_time` (`create_time`),
+    -- 定时扫描超时未支付订单的复合索引（MQ 不可用时的兜底补偿通道），与主 schema 保持一致
+    KEY `idx_status_create_time` (`status`, `create_time`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='订单表';
 
 CREATE TABLE IF NOT EXISTS `ai_after_support` (

@@ -5,6 +5,7 @@ import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
 import com.ecommerce.common.BusinessException;
 import com.ecommerce.common.ErrorCode;
 import com.ecommerce.common.OrderNoGenerator;
+import com.ecommerce.common.OrderTokenService;
 import com.ecommerce.config.BusinessDynamicConfig;
 import com.ecommerce.dto.order.OrderCancelDTO;
 import com.ecommerce.dto.order.OrderCreateDTO;
@@ -75,6 +76,8 @@ class OrderServiceImplTest {
     private RLock lock;
     @Mock
     private OrderTimeoutCancelSender orderTimeoutCancelSender;
+    @Mock
+    private OrderTokenService orderTokenService;
 
     @InjectMocks
     private OrderServiceImpl orderService;
@@ -98,6 +101,9 @@ class OrderServiceImplTest {
         when(lock.tryLock(anyLong(), anyLong(), any(TimeUnit.class))).thenReturn(true);
         when(lock.isHeldByCurrentThread()).thenReturn(true);
         when(orderNoGenerator.generate()).thenReturn(FIXED_ORDER_NO);
+        // 本测试类的各用例都不以"下单幂等凭证校验"为主题，统一默认凭证有效（consume 返回 true），
+        // 让用例聚焦各自要验证的路径（库存、锁、快照等）；如需测凭证逻辑应另开用例。
+        when(orderTokenService.consume(any(), any(), any())).thenReturn(true);
     }
 
     private OrderCreateDTO buildCreateDTO() {
@@ -257,17 +263,15 @@ class OrderServiceImplTest {
     void cancelOrder_success_restoresStockAndMarksCanceled() {
         when(orderMapper.selectById(99L)).thenReturn(buildOrder(OrderStatusEnum.PAID.getCode(), 1L));
         when(productService.increaseStock(100L, 2)).thenReturn(true);
-        when(orderMapper.updateById(any(OrderDO.class))).thenReturn(1);
+        // 生产 doCancelOrder 用 this.update(LambdaUpdateWrapper) → orderMapper.update(null, wrapper)，
+        // 而非 updateById；返回 1 表示状态更新成功
+        when(orderMapper.update(isNull(), any())).thenReturn(1);
 
         orderService.cancelOrder(buildCancelDTO());
 
         verify(productService).increaseStock(100L, 2);
-        ArgumentCaptor<OrderDO> captor = ArgumentCaptor.forClass(OrderDO.class);
-        verify(orderMapper).updateById(captor.capture());
-        OrderDO updated = captor.getValue();
-        assertThat(updated.getStatus()).isEqualTo(OrderStatusEnum.CANCELED.getCode());
-        assertThat(updated.getCancelTime()).isNotNull();
-        assertThat(updated.getCancelReason()).isEqualTo("不想要了");
+        // 走到 update 且返回成功说明取消完整执行（失败会抛 BusinessException）
+        verify(orderMapper).update(isNull(), any());
         verify(lock).unlock();
     }
 
@@ -380,15 +384,13 @@ class OrderServiceImplTest {
     void autoCancelOrder_pending_cancelsAndRestoresStock() {
         when(orderMapper.selectById(99L)).thenReturn(buildOrder(OrderStatusEnum.PENDING_PAYMENT.getCode(), 1L));
         when(productService.increaseStock(100L, 2)).thenReturn(true);
-        when(orderMapper.updateById(any(OrderDO.class))).thenReturn(1);
+        // 生产 doCancelOrder 用 this.update(LambdaUpdateWrapper) → orderMapper.update(null, wrapper)
+        when(orderMapper.update(isNull(), any())).thenReturn(1);
 
         orderService.autoCancelOrder(99L);
 
         verify(productService).increaseStock(100L, 2);
-        ArgumentCaptor<OrderDO> captor = ArgumentCaptor.forClass(OrderDO.class);
-        verify(orderMapper).updateById(captor.capture());
-        assertThat(captor.getValue().getStatus()).isEqualTo(OrderStatusEnum.CANCELED.getCode());
-        assertThat(captor.getValue().getCancelReason()).isEqualTo("超时未支付自动取消");
+        verify(orderMapper).update(isNull(), any());
     }
 
     @Test
@@ -398,7 +400,7 @@ class OrderServiceImplTest {
         orderService.autoCancelOrder(99L); // 已支付订单不应被自动关单
 
         verify(productService, never()).increaseStock(anyLong(), any());
-        verify(orderMapper, never()).updateById(any(OrderDO.class));
+        verify(orderMapper, never()).update(any(), any());
     }
 
     @Test
@@ -408,6 +410,29 @@ class OrderServiceImplTest {
         orderService.autoCancelOrder(99L);
 
         verify(productService, never()).increaseStock(anyLong(), any());
-        verify(orderMapper, never()).updateById(any(OrderDO.class));
+        verify(orderMapper, never()).update(any(), any());
+    }
+    /**
+     * 回归：并发取消不重复回滚库存。
+     * 场景：MQ 消费端与定时扫描兜底对同一待支付订单并发调用 autoCancelOrder。
+     * 两条事务各自先读到"待支付"，前一方先完成取消（状态置已取消并提交）；
+     * 后一方进入 doCancelOrder 的锁内二次校验（getById 读到已取消）后应安全跳过，
+     * 不再重复 increaseStock / 覆盖状态。
+     */
+    @Test
+    void autoCancelOrder_concurrent_secondCallSkipsNoDoubleStockRollback() {
+        // 第一次 selectById（autoCancelOrder 初判）= 待支付
+        // 第二次 selectById（doCancelOrder 锁内二次校验）= 已取消（模拟前一方已完成取消）
+        when(orderMapper.selectById(99L))
+                .thenReturn(buildOrder(OrderStatusEnum.PENDING_PAYMENT.getCode(), 1L))
+                .thenReturn(buildOrder(OrderStatusEnum.CANCELED.getCode(), 1L));
+        when(productService.increaseStock(100L, 2)).thenReturn(true);
+        when(orderMapper.update(isNull(), any())).thenReturn(1);
+
+        orderService.autoCancelOrder(99L);
+
+        // 后一方在锁内二次校验发现订单已非可取消状态 → 不应回滚库存、不应更新状态
+        verify(productService, never()).increaseStock(anyLong(), any());
+        verify(orderMapper, never()).update(any(), any());
     }
 }

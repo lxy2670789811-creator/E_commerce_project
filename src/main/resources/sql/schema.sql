@@ -101,7 +101,11 @@ CREATE TABLE `orders` (
     KEY `idx_user_id` (`user_id`),
     KEY `idx_product_id` (`product_id`),
     KEY `idx_status` (`status`),
-    KEY `idx_create_time` (`create_time`)
+    KEY `idx_create_time` (`create_time`),
+    -- 定时扫描超时未支付订单的复合索引（MQ 不可用时的兜底补偿通道）：
+    -- 查询条件为 status = 待支付 AND create_time < now()-超时阈值，联合索引可让优化器一次命中并覆盖排序，
+    -- 避免在 idx_status 结果集内做 create_time 内存过滤。列顺序：等值(status)在前、范围(create_time)在后。
+    KEY `idx_status_create_time` (`status`, `create_time`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='订单表';
 
 -- ============================================================

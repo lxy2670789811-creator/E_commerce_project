@@ -376,6 +376,25 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, OrderDO> implemen
 
             // 锁获取成功后，将释放动作挂到事务提交/回滚之后执行
             releaseLockAfterTransaction(lock, lockKey);
+
+            // 【并发幂等加固】锁内二次校验状态：
+            // 场景：MQ 消费端与定时扫描兜底可能对同一订单并发调用取消（两条事务都先读到"待支付"）。
+            // 二者争用同一个"商品维度"分布式锁，若不做二次校验，后拿到锁的一方会再次回滚库存（重复加库存）
+            // 并覆盖状态。由于锁的释放被挂在事务提交之后（releaseLockAfterTransaction），前一方已把订单
+            // 置为"已取消"并提交后才释放锁，因此后一方在此处读到的最新状态必然非"可取消"，从而安全跳过。
+            OrderDO freshOrder = this.getById(order.getId());
+            if (freshOrder == null || !OrderStatusEnum.canCancel(freshOrder.getStatus())) {
+                log.info("订单取消跳过：锁内二次校验发现订单已非可取消状态（status={}），疑似被并发取消，orderId={}",
+                        freshOrder == null ? "null" : freshOrder.getStatus(), order.getId());
+                return;
+            }
+            // 以最新状态为准（可能在加锁等待期间已被支付/流转），避免基于过期快照回滚库存
+            if (!Objects.equals(freshOrder.getStatus(), order.getStatus())) {
+                log.info("订单取消：加锁期间状态已变化（{} -> {}），以最新状态重新校验，orderId={}",
+                        order.getStatus(), freshOrder.getStatus(), order.getId());
+                order = freshOrder;
+            }
+
             // 校验回滚结果：increaseStock 的 SQL 带 deleted=0 条件，商品被逻辑删除时返回 false。
             // 早期版本未校验返回值就打印"回滚成功"，会导致库存实际未回滚却把订单置为已取消
             // （库存凭空丢失且无日志可查）。这里补齐校验，失败即中止取消流程。
