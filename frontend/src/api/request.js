@@ -8,11 +8,36 @@ import { ElMessage } from 'element-plus'
  *    - code === 0 表示成功，直接把 data 返回给调用方
  *    - code !== 0 统一弹出错误提示
  * 3. 统一网络异常处理
+ * 4. JWT：若 localStorage 中存有 token（登录后写入），自动附带 Authorization: Bearer <token>；
+ *    未登录不带头（后端处于兼容模式，缺 token 的请求放行，沿用 userId 参数）
  */
+const TOKEN_KEY = 'ecommerce_token'
+
+export function getToken() {
+  return localStorage.getItem(TOKEN_KEY)
+}
+
+export function setToken(token) {
+  if (token) {
+    localStorage.setItem(TOKEN_KEY, token)
+  } else {
+    localStorage.removeItem(TOKEN_KEY)
+  }
+}
+
 const service = axios.create({
   baseURL: '/api',
   // AI 售后分析接口耗时较长（后端 30 秒超时），这里给足时间
   timeout: 60000
+})
+
+// 请求拦截器：附带 JWT
+service.interceptors.request.use((config) => {
+  const token = getToken()
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`
+  }
+  return config
 })
 
 // 响应拦截器：统一处理 Result<T>
@@ -34,7 +59,13 @@ service.interceptors.response.use(
     if (error.code === 'ECONNABORTED') {
       msg = '请求超时，请稍后重试'
     } else if (error.response) {
-      msg = `请求失败（HTTP ${error.response.status}）`
+      // 401：token 失效，清除本地 token
+      if (error.response.status === 401) {
+        setToken(null)
+        msg = '登录状态已失效，请重新登录'
+      } else {
+        msg = `请求失败（HTTP ${error.response.status}）`
+      }
     }
     ElMessage.error(msg)
     return Promise.reject(error)

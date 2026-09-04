@@ -71,6 +71,17 @@ ecommerce:
     # --- 订单超时未支付自动关单（RocketMQ 延迟消息） ---
     order-timeout-cancel-enabled: true      # 超时关单总开关
     order-timeout-cancel-delay-level: 9     # 延迟级别（9=5分钟，详见 BusinessDynamicConfig）
+    # --- 下单幂等（一次性凭证） ---
+    order-token-enabled: true               # 凭证校验开关：false 时仅由数据库唯一索引兜底
+    order-token-expire-seconds: 300         # 凭证有效期（秒）：进入下单页领取后 5 分钟内有效
+
+# JWT 认证配置（secret 生产必须用环境变量覆盖，勿硬编码）
+ecommerce:
+  jwt:
+    secret: ${JWT_SECRET:ecommerce-order-demo-secret-key-please-change-in-prod-0123456789}  # HMAC 签名密钥，≥32字节
+    expire-seconds: 86400      # token 有效期（秒），默认 1 天
+    required: false            # 硬鉴权开关：true=受保护路径必须带有效token；false=兼容模式（缺token放行，用userId参数）
+    allow-plain-text-login: true  # 允许存量明文密码自动升级为 BCrypt（生产稳定后可置 false）
 
 # DeepSeek AI 配置（密钥从环境变量读取，未设置时 AI 售后自动走"待人工审核"降级）
 deepseek:

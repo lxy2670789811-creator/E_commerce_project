@@ -33,10 +33,13 @@ import org.springframework.stereotype.Component;
  *     deepseek-error-ratio-threshold: 0.5   # Feign 异常比例熔断阈值
  *     # --- 缓存 ---
  *     product-detail-expire-seconds: 3600   # 商品详情缓存过期
- *     # --- 订单超时关单 ---
- *     order-timeout-cancel-enabled: true      # 超时关单总开关
- *     order-timeout-cancel-delay-level: 9     # 延迟级别（9=5分钟）
- */
+     *     # --- 订单超时关单 ---
+     *     order-timeout-cancel-enabled: true      # 超时关单总开关
+     *     order-timeout-cancel-delay-level: 9     # 延迟级别（9=5分钟）
+     *     # --- 下单幂等（一次性凭证） ---
+     *     order-token-enabled: true               # 凭证校验开关
+     *     order-token-expire-seconds: 300         # 凭证有效期（秒）
+     */
 @Data
 @Component
 @RefreshScope // 关键：开启 Nacos 配置动态刷新
@@ -138,4 +141,18 @@ public class BusinessDynamicConfig {
      * 默认：9（5分钟）
      */
     private int orderTimeoutCancelDelayLevel = 9;
+
+    // ====== 下单幂等（一次性凭证） ======
+    /**
+     * 下单一次性凭证开关
+     * true = 校验凭证，重复提交（同一凭证第二次使用）直接拒绝
+     * false = 跳过凭证校验（紧急降级开关），由数据库唯一索引 uk_idempotency_token 兜底
+     */
+    private boolean orderTokenEnabled = true;
+
+    /**
+     * 下单凭证有效期（秒）
+     * 默认：300秒（5分钟，够用户填完下单页；过期需重新进入下单页领取）
+     */
+    private long orderTokenExpireSeconds = 300L;
 }

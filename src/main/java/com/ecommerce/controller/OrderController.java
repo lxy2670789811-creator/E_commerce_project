@@ -30,11 +30,24 @@ public class OrderController {
 
     private final OrderService orderService;
 
-    @Operation(summary = "创建订单", description = "下单流程：Redisson按商品ID加锁 + DB乐观扣减，双层防超卖；下单成功后发送 RocketMQ 延迟消息用于超时自动关单")
+    @Operation(summary = "创建订单", description = "下单流程：一次性凭证防重复提交 + Redisson按商品ID加锁 + DB原子扣减防超卖；"
+            + "下单成功后发送 RocketMQ 延迟消息用于超时自动关单")
     @PostMapping("/create")
     public Result<String> createOrder(@RequestBody @Valid OrderCreateDTO dto) {
         String orderNo = orderService.createOrder(dto);
         return Result.success(orderNo);
+    }
+
+    @Operation(summary = "获取下单凭证", description = "进入下单页时调用，返回一次性凭证（幂等用）。"
+            + "提交订单时在 body 中携带该凭证，服务端校验后即销毁；同一凭证第二次提交会被拒绝，"
+            + "从而防止双击、前端超时重试、网络重发导致的重复下单与重复扣库存")
+    @GetMapping("/token")
+    public Result<String> generateOrderToken(
+            @Parameter(description = "用户ID", required = true, example = "1")
+            @RequestParam @NotNull(message = "用户ID不能为空") Long userId,
+            @Parameter(description = "商品ID", required = true, example = "1")
+            @RequestParam @NotNull(message = "商品ID不能为空") Long productId) {
+        return Result.success(orderService.generateOrderToken(userId, productId));
     }
 
     @Operation(summary = "订单列表", description = "分页查询指定用户的订单列表，可按订单状态筛选")

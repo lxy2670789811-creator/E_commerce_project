@@ -25,6 +25,6 @@ public class UserLoginVO {
     @Schema(description = "昵称", example = "测试用户1")
     private String nickname;
 
-    @Schema(description = "模拟Token（极简实现，生产请用JWT）", example = "mock-token-xxxxxxx")
+    @Schema(description = "JWT token：后续请求放在 Authorization: Bearer <token> 头", example = "eyJhbGciOiJIUzI1NiJ9...")
     private String token;
 }

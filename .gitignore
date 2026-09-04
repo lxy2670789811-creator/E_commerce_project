@@ -9,6 +9,7 @@
 target/
 frontend/dist/
 frontend/node_modules/
+perf/
 
 # ===== Local env / secrets（密钥绝不提交）=====
 .env
@@ -26,3 +27,4 @@ derby.log
 # ===== OS =====
 .DS_Store
 Thumbs.db
+

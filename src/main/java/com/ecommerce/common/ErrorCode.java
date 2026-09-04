@@ -15,7 +15,6 @@ public enum ErrorCode {
     UNAUTHORIZED(401, "未授权"),
     FORBIDDEN(403, "禁止访问"),
     NOT_FOUND(404, "资源不存在"),
-
     // 业务错误 1000-1999
     PRODUCT_NOT_FOUND(1001, "商品不存在"),
     PRODUCT_OFF_SHELF(1002, "商品已下架"),
@@ -26,10 +25,13 @@ public enum ErrorCode {
     ORDER_STATUS_ERROR(2002, "订单状态不允许此操作"),
     ORDER_CANCEL_FAILED(2003, "订单取消失败"),
     ORDER_CREATE_FAILED(2004, "订单创建失败"),
+    ORDER_TOKEN_INVALID(2005, "下单凭证无效或已失效，请返回下单页重试"),
+    ORDER_DUPLICATE_SUBMIT(2006, "请勿重复提交订单"),
 
     USER_NOT_FOUND(3001, "用户不存在"),
     USER_LOGIN_FAILED(3002, "用户名或密码错误"),
     ADDRESS_NOT_FOUND(3003, "收货地址不存在"),
+    TOKEN_INVALID(3004, "登录凭证无效或已过期，请重新登录"),
 
     // 系统错误 5000-5999
     SYSTEM_ERROR(5000, "系统异常"),

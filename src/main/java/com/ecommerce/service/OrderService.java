@@ -16,11 +16,22 @@ import java.util.List;
 public interface OrderService extends IService<OrderDO> {
 
     /**
-     * 创建订单（核心：Redisson分布式锁 + DB乐观锁 防超卖）
+     * 创建订单（核心：Redisson分布式锁 + DB原子扣减 防超卖 + 一次性凭证 防重复提交）
      *
      * @return 订单号
      */
     String createOrder(OrderCreateDTO dto);
+
+    /**
+     * 生成下单一次性凭证（幂等用）
+     *
+     * <p>进入下单页时调用，提交订单时携带；凭证一次性，用后即焚。</p>
+     *
+     * @param userId    用户ID
+     * @param productId 商品ID
+     * @return 凭证字符串
+     */
+    String generateOrderToken(Long userId, Long productId);
 
     /**
      * 分页查询用户订单列表

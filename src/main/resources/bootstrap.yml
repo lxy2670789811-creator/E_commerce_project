@@ -28,5 +28,5 @@ spring:
         # 开启配置动态刷新
         refresh-enabled: true
         # 用户名密码（Nacos 默认）
-        username: ${NACOS_USERNAME:nacos}
-        password: ${NACOS_PASSWORD:nacos}
+        # username: ${NACOS_USERNAME:nacos}
+        # password: ${NACOS_PASSWORD:nacos}

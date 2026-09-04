@@ -76,7 +76,8 @@ class OrderConcurrencyIntegrationTest {
 
         UserDO user = new UserDO();
         user.setUsername("concurrency_user");
-        user.setPassword("123456");
+        // 存 BCrypt("123456") 的哈希，与生产保持一致（该用例不登录，仅用于 FK）
+        user.setPassword("$2a$10$43zntPUfCGS3fihhvF9VAew0XnfnXlUU0Xz8d3k0xCdm9IutfyPjC");
         user.setStatus(1);
         userMapper.insert(user);
         userId = user.getId();
@@ -116,6 +117,10 @@ class OrderConcurrencyIntegrationTest {
                 dto.setProductId(productId);
                 dto.setQuantity(1);
                 dto.setAddressId(addressId);
+                // 每个线程领取一张独立的一次性凭证，模拟 40 个彼此独立的购买意图。
+                // 注意：不能共用同一张凭证，否则会被幂等校验判定为重复提交而拒绝——
+                // 这正是本用例要验证的"防重复提交"与"防超卖"是两件事。
+                dto.setToken(orderService.generateOrderToken(userId, productId));
                 try {
                     orderService.createOrder(dto);
                     return null; // 成功

@@ -9,13 +9,18 @@ import com.ecommerce.entity.UserDO;
 public interface UserService extends IService<UserDO> {
 
     /**
-     * 模拟登录
+     * 登录（BCrypt 校验密码）
      *
      * @param username 用户名
-     * @param password 密码
-     * @return 用户ID
+     * @param password 明文密码
+     * @return 签发的 JWT token
      */
-    Long login(String username, String password);
+    String login(String username, String password);
+
+    /**
+     * 按用户名查询用户
+     */
+    UserDO getUserByUsername(String username);
 
     /**
      * 根据ID获取用户

@@ -9,6 +9,7 @@ import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.ecommerce.common.BusinessException;
 import com.ecommerce.common.ErrorCode;
 import com.ecommerce.common.OrderNoGenerator;
+import com.ecommerce.common.OrderTokenService;
 import com.ecommerce.common.PageResult;
 import com.ecommerce.config.BusinessDynamicConfig;
 import com.ecommerce.convert.OrderConvert;
@@ -32,6 +33,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
@@ -73,6 +75,8 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, OrderDO> implemen
     private final BusinessDynamicConfig businessDynamicConfig;
     /** 订单号生成器（ORD + 秒级时间戳 + 完整雪花ID，保证全局唯一） */
     private final OrderNoGenerator orderNoGenerator;
+    /** 下单一次性凭证服务（幂等：防重复提交，Redis + Lua 原子消耗） */
+    private final OrderTokenService orderTokenService;
     /** 超时关单延迟消息发送器（MQ 不可用时降级，不影响下单） */
     private final OrderTimeoutCancelSender orderTimeoutCancelSender;
 
@@ -93,6 +97,14 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, OrderDO> implemen
         }
         if (product.getStatus() == null || product.getStatus() != 1) {
             throw new BusinessException(ErrorCode.PRODUCT_OFF_SHELF);
+        }
+
+        // 1.1 幂等第一层：校验并消耗一次性凭证（Redis + Lua 原子 GETDEL）
+        //     放在锁外是安全的——Lua 的原子性保证并发下只有一个请求能消耗成功，
+        //     同时避免在持锁期间额外增加网络往返，缩短锁持有时间。
+        //     凭证无效/已被使用 → 判定为重复提交，直接拒绝。
+        if (!orderTokenService.consume(dto.getToken(), dto.getUserId(), dto.getProductId())) {
+            throw new BusinessException(ErrorCode.ORDER_TOKEN_INVALID);
         }
 
         // 2. 按【单个商品ID】获取分布式锁，保证同一商品并发下单时库存扣减的串行化
@@ -165,6 +177,13 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, OrderDO> implemen
 
         } catch (BusinessException e) {
             throw e;
+        } catch (DuplicateKeyException e) {
+            // 幂等第二层兜底：uk_idempotency_token 唯一索引冲突。
+            // 走到这里说明凭证层失效（Redis 故障降级放行）或请求绕过凭证直接调接口，
+            // 由数据库唯一索引做最终拦截，防止同一凭证重复下单、重复扣库存。
+            log.warn("订单创建被幂等凭证唯一索引拦截（重复提交）：userId={}, productId={}",
+                    dto.getUserId(), dto.getProductId());
+            throw new BusinessException(ErrorCode.ORDER_DUPLICATE_SUBMIT);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new BusinessException(ErrorCode.ORDER_CREATE_FAILED, "获取锁被中断");
@@ -194,6 +213,24 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, OrderDO> implemen
         log.error("【Sentinel降级兜底】创建订单接口发生非限流异常：userId={}, productId={}",
                 dto.getUserId(), dto.getProductId(), t);
         throw t;
+    }
+
+    /**
+     * 生成下单一次性凭证（幂等用）
+     *
+     * <p>客户端流程：进入下单页 → 调本接口领凭证 → 提交订单时携带 → 服务端用后即焚。
+     * 用户想再下一单同样的商品，需要重新进入下单页领取新凭证——
+     * 这一步天然区分了"用户有意的第二次购买"和"误触/重试产生的重复提交"。</p>
+     */
+    @Override
+    public String generateOrderToken(Long userId, Long productId) {
+        // 顺带做一次存在性校验，避免给不存在的用户/商品发凭证
+        userService.getUserById(userId);
+        ProductDO product = productService.getById(productId);
+        if (product == null) {
+            throw new BusinessException(ErrorCode.PRODUCT_NOT_FOUND);
+        }
+        return orderTokenService.generate(userId, productId);
     }
 
     @Override
@@ -339,7 +376,15 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, OrderDO> implemen
 
             // 锁获取成功后，将释放动作挂到事务提交/回滚之后执行
             releaseLockAfterTransaction(lock, lockKey);
-            productService.increaseStock(order.getProductId(), order.getQuantity());
+            // 校验回滚结果：increaseStock 的 SQL 带 deleted=0 条件，商品被逻辑删除时返回 false。
+            // 早期版本未校验返回值就打印"回滚成功"，会导致库存实际未回滚却把订单置为已取消
+            // （库存凭空丢失且无日志可查）。这里补齐校验，失败即中止取消流程。
+            boolean rollbackOk = productService.increaseStock(order.getProductId(), order.getQuantity());
+            if (!rollbackOk) {
+                log.error("订单取消中止：库存回滚未生效，productId={}, 回滚数量={}",
+                        order.getProductId(), order.getQuantity());
+                throw new BusinessException(ErrorCode.ORDER_CANCEL_FAILED, "库存回滚失败，请稍后重试");
+            }
             log.info("订单取消：回滚库存成功，productId={}, 回滚数量={}", order.getProductId(), order.getQuantity());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -347,10 +392,15 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, OrderDO> implemen
         }
 
         // 2. 更新订单状态为已取消
-        order.setStatus(OrderStatusEnum.CANCELED.getCode());
-        order.setCancelTime(LocalDateTime.now());
-        order.setCancelReason(reason);
-        this.updateById(order);
+        //    这里用条件更新而非 updateById：一是避免并发下覆盖其他状态流转，二是能拿到"是否更新成功"的结果
+        boolean canceled = this.update(new LambdaUpdateWrapper<OrderDO>()
+                .eq(OrderDO::getId, order.getId())
+                .set(OrderDO::getStatus, OrderStatusEnum.CANCELED.getCode())
+                .set(OrderDO::getCancelTime, LocalDateTime.now())
+                .set(OrderDO::getCancelReason, reason));
+        if (!canceled) {
+            throw new BusinessException(ErrorCode.ORDER_CANCEL_FAILED, "订单状态更新失败，请稍后重试");
+        }
         log.info("订单取消成功：orderId={}, orderNo={}, reason={}", order.getId(), order.getOrderNo(), reason);
     }
 
@@ -398,6 +448,8 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, OrderDO> implemen
         order.setAddressId(dto.getAddressId());
         order.setAddressSnapshot(buildAddressSnapshot(address));
         order.setStatus(OrderStatusEnum.PENDING_PAYMENT.getCode());
+        // 记录本次下单使用的幂等凭证，配合 uk_idempotency_token 唯一索引做数据库层兜底
+        order.setIdempotencyToken(dto.getToken());
         return order;
     }
 

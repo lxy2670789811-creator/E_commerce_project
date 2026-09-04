@@ -13,7 +13,7 @@ DROP TABLE IF EXISTS `sys_user`;
 CREATE TABLE `sys_user` (
     `id`          BIGINT       NOT NULL AUTO_INCREMENT COMMENT '用户ID',
     `username`    VARCHAR(64)  NOT NULL COMMENT '用户名',
-    `password`    VARCHAR(128) NOT NULL DEFAULT '123456' COMMENT '密码（模拟）',
+    `password`    VARCHAR(128) NOT NULL DEFAULT '$2a$10$43zntPUfCGS3fihhvF9VAew0XnfnXlUU0Xz8d3k0xCdm9IutfyPjC' COMMENT '密码（BCrypt哈希，测试用户明文均为123456）',
     `nickname`    VARCHAR(64)           DEFAULT NULL COMMENT '昵称',
     `phone`       VARCHAR(20)           DEFAULT NULL COMMENT '手机号',
     `status`      TINYINT      NOT NULL DEFAULT 1 COMMENT '状态：1-正常 0-禁用',
@@ -88,11 +88,16 @@ CREATE TABLE `orders` (
     `finish_time`     DATETIME                 DEFAULT NULL COMMENT '完成时间',
     `cancel_time`     DATETIME                 DEFAULT NULL COMMENT '取消时间',
     `cancel_reason`   VARCHAR(500)             DEFAULT NULL COMMENT '取消原因',
+    -- 下单幂等凭证：记录创建本订单时使用的一次性 token，用于数据库层兜底去重
+    `idempotency_token` VARCHAR(64)           DEFAULT NULL COMMENT '下单幂等凭证token（一次性，唯一索引兜底去重）',
     `create_time`     DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     `update_time`     DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
     `deleted`         TINYINT         NOT NULL DEFAULT 0 COMMENT '逻辑删除：0-未删除 1-已删除',
     PRIMARY KEY (`id`),
     UNIQUE KEY `uk_order_no` (`order_no`),
+    -- 幂等兜底唯一索引：与 Redis 一次性凭证互为独立的两层防护（凭证层失效时仍可拦截重复下单）
+    -- MySQL 唯一索引允许多行 NULL，因此关闭凭证功能时不会互相冲突
+    UNIQUE KEY `uk_idempotency_token` (`idempotency_token`),
     KEY `idx_user_id` (`user_id`),
     KEY `idx_product_id` (`product_id`),
     KEY `idx_status` (`status`),
@@ -126,10 +131,10 @@ CREATE TABLE `ai_after_support` (
 -- 初始化测试数据
 -- ============================================================
 
--- 插入测试用户
-INSERT INTO `sys_user` (`id`, `username`, `nickname`, `phone`) VALUES
-(1, 'test001', '测试用户1', '13800138001'),
-(2, 'test002', '测试用户2', '13800138002');
+-- 插入测试用户（密码统一为 BCrypt("123456")；登录用 test001/123456、test002/123456）
+INSERT INTO `sys_user` (`id`, `username`, `password`, `nickname`, `phone`) VALUES
+(1, 'test001', '$2a$10$43zntPUfCGS3fihhvF9VAew0XnfnXlUU0Xz8d3k0xCdm9IutfyPjC', '测试用户1', '13800138001'),
+(2, 'test002', '$2a$10$43zntPUfCGS3fihhvF9VAew0XnfnXlUU0Xz8d3k0xCdm9IutfyPjC', '测试用户2', '13800138002');
 
 -- 插入测试地址
 INSERT INTO `user_address` (`user_id`, `receiver`, `phone`, `province`, `city`, `district`, `detail`, `is_default`) VALUES

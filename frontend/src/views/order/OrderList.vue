@@ -133,7 +133,7 @@
 import { onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useRouter } from 'vue-router'
-import { listOrders, getOrderDetail, createOrder, cancelOrder, payCallback, shipOrder, finishOrder } from '../../api/order'
+import { listOrders, getOrderDetail, createOrder, cancelOrder, payCallback, shipOrder, finishOrder, getOrderToken } from '../../api/order'
 
 const router = useRouter()
 
@@ -193,7 +193,10 @@ async function submitCreate() {
   await createFormRef.value.validate()
   createDialog.submitting = true
   try {
-    const orderNo = await createOrder({ ...createForm })
+    // 幂等：先领取一次性下单凭证，再随订单一起提交。
+    // 同一凭证第二次提交会被后端拒绝，防止双击/前端超时重试导致的重复下单。
+    const token = await getOrderToken({ userId: createForm.userId, productId: createForm.productId })
+    const orderNo = await createOrder({ ...createForm, token })
     ElMessage.success(`下单成功，订单号：${orderNo}`)
     createDialog.visible = false
     query.userId = createForm.userId
