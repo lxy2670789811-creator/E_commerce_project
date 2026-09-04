@@ -33,9 +33,13 @@ import org.springframework.stereotype.Component;
  *     deepseek-error-ratio-threshold: 0.5   # Feign 异常比例熔断阈值
  *     # --- 缓存 ---
  *     product-detail-expire-seconds: 3600   # 商品详情缓存过期
-     *     # --- 订单超时关单 ---
+     *     # --- 订单超时关单（延迟消息 + 定时扫描兜底） ---
      *     order-timeout-cancel-enabled: true      # 超时关单总开关
      *     order-timeout-cancel-delay-level: 9     # 延迟级别（9=5分钟）
+     *     order-timeout-scan-enabled: true        # 定时扫描兜底开关
+     *     order-timeout-scan-cron: "0 0/1 * * * ?" # 扫描 cron（等价每分钟）
+     *     order-timeout-seconds: 300              # 超时阈值（秒）
+     *     order-timeout-scan-batch-size: 100      # 单批处理上限
      *     # --- 下单幂等（一次性凭证） ---
      *     order-token-enabled: true               # 凭证校验开关
      *     order-token-expire-seconds: 300         # 凭证有效期（秒）
@@ -141,6 +145,30 @@ public class BusinessDynamicConfig {
      * 默认：9（5分钟）
      */
     private int orderTimeoutCancelDelayLevel = 9;
+
+    // ====== 订单超时关单 - 定时扫描兜底（RocketMQ 延迟消息失效时的补偿） ======
+    /**
+     * 定时扫描兜底开关（RocketMQ 不可用/消息丢失时的补偿）
+     * true = 由 @Scheduled 定时扫描超时未支付订单并自动关单
+     */
+    private boolean orderTimeoutScanEnabled = true;
+
+    /**
+     * 定时扫描 cron 表达式（Spring 6 位格式，含秒）
+     * 默认：每分钟执行一次
+     */
+    private String orderTimeoutScanCron = "0 */1 * * * ?";
+
+    /**
+     * 订单超时阈值（秒）：创建时间早于 now-超时阈值 且仍为待支付的订单视为超时
+     * 默认：300（5分钟，与 RocketMQ 默认延迟级别 9 对齐，避免扫描比延迟消息更早误关）
+     */
+    private long orderTimeoutSeconds = 300L;
+
+    /**
+     * 定时扫描单批处理的最大订单数（防止单次任务积压过多拖垮线程）
+     */
+    private int orderTimeoutScanBatchSize = 100;
 
     // ====== 下单幂等（一次性凭证） ======
     /**

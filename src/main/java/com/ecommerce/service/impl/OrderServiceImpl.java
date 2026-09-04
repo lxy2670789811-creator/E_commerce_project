@@ -159,7 +159,7 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, OrderDO> implemen
                     order.getId(), order.getOrderNo(), dto.getUserId(), dto.getProductId(),
                     dto.getQuantity(), order.getTotalAmount());
 
-            // 6. 事务提交后再发送"超时未支付自动关单"延迟消息（避免消费端读到未提交的订单）
+            // 6. 事务提交后再发送"超时未支付自动关单"延迟消息（为了防止“订单没生成，关单消息却发出去了”）
             if (TransactionSynchronizationManager.isSynchronizationActive()) {
                 TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
                     @Override

@@ -131,7 +131,7 @@ java -jar app.jar --spring.profiles.active=prod
 1. **防超卖**：Sentinel 入口限流 → Redisson 按商品 ID 加锁（同商品串行）→ SQL `stock >= quantity` 原子扣减（DB 最终兜底）。
    锁在**事务提交/回滚后**释放（`TransactionSynchronization.afterCompletion`），避免"锁先释放、事务未提交"的并发窗口。
 2. **缓存一致性**：Cache-Aside + 写后删缓存（而非更新缓存），避免并发覆盖旧值；Redis 异常降级查库不影响主流程。
-3. **超时自动关单**：下单事务提交后发送 RocketMQ 延迟消息（延迟级别可动态配置），消费端幂等关单、回滚库存。
+3. **超时自动关单**：下单事务提交后发送 RocketMQ 延迟消息（延迟级别可动态配置），消费端幂等关单、回滚库存；另配 `@Scheduled` 定时扫描兜底——周期扫描"仍为待支付且超过超时阈值"的订单并复用幂等关单，RocketMQ 不可用/消息丢失时仍能补偿关单，延迟消息与定时扫描互为双保险。
 4. **AI 售后降级**：动态开关 → Sentinel 慢调用/异常比例熔断 → Redis 滑动窗口限流（Lua 原子）→ Feign 熔断 → "待人工审核"兜底，AI 完全不可用时接口仍可用。
 5. **订单号唯一性**：`ORD + 秒级时间戳 + 完整雪花ID`，并发的订单号测试验证无重复。
 6. **JWT 鉴权（零依赖手写实现）**：登录签发 HMAC-SHA256 三段式 Token，`JwtAuthInterceptor` 解析后写入 `AuthContext`（ThreadLocal）传递身份，业务层取身份而非信任请求参数；请求结束 `clear()` 防线程池复用串号；`required` 开关支持兼容模式（缺 Token 放行），`allow-plain-text-login` 支持存量明文密码自动升级 BCrypt。
@@ -152,7 +152,7 @@ src/main/java/com/ecommerce
 ├── enums       # 订单状态机
 ├── feign       # DeepSeek OpenFeign 客户端 + 熔断降级
 ├── mapper      # MyBatis-Plus Mapper
-├── mq          # RocketMQ 超时关单生产者/消费者
+├── mq          # RocketMQ 超时关单生产者/消费者 + 定时扫描兜底（@Scheduled 补偿）
 ├── service     # 业务层
 └── vo          # 响应对象
 ```

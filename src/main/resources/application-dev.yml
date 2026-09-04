@@ -44,7 +44,7 @@ spring:
       feign:
         enabled: true
 
-# RocketMQ（未启动时下单主流程不受影响，仅超时关单功能暂不可用）
+# RocketMQ（未启动时下单主流程不受影响；超时关单由定时扫描兜底补偿，见 OrderTimeoutScanScheduler）
 rocketmq:
   name-server: ${ROCKETMQ_NAME_SERVER:127.0.0.1:9876}
   producer:

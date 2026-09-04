@@ -68,9 +68,13 @@ ecommerce:
     deepseek-error-ratio-threshold: 0.5     # Feign 异常比例熔断阈值
     # --- 缓存 ---
     product-detail-expire-seconds: 3600     # 商品详情缓存过期（秒）
-    # --- 订单超时未支付自动关单（RocketMQ 延迟消息） ---
+    # --- 订单超时未支付自动关单（RocketMQ 延迟消息 + 定时扫描兜底） ---
     order-timeout-cancel-enabled: true      # 超时关单总开关
     order-timeout-cancel-delay-level: 9     # 延迟级别（9=5分钟，详见 BusinessDynamicConfig）
+    order-timeout-scan-enabled: true        # 定时扫描兜底开关（RocketMQ 失效时的补偿）
+    order-timeout-scan-cron: "0 */1 * * * ?" # 扫描 cron（Spring 6位格式，默认每分钟）
+    order-timeout-seconds: 300              # 超时阈值（秒，默认5分钟，与延迟级别9对齐）
+    order-timeout-scan-batch-size: 100      # 单批扫描处理上限
     # --- 下单幂等（一次性凭证） ---
     order-token-enabled: true               # 凭证校验开关：false 时仅由数据库唯一索引兜底
     order-token-expire-seconds: 300         # 凭证有效期（秒）：进入下单页领取后 5 分钟内有效
