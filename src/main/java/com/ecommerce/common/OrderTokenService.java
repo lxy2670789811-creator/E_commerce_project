@@ -28,7 +28,7 @@ import java.util.UUID;
  *   Lua 脚本在 Redis 内原子执行，"取出并删除"要么全做要么全不做，杜绝这个窗口。
  *   （Redis 6.2+ 有原生 GETDEL 命令，这里用 Lua 是为了兼容低版本。）</p>
  *
- * <p>降级策略：Redis 故障时放行（fail-open），由数据库唯一索引 uk_pending_unique 兜底。
+ * <p>降级策略：Redis 故障时放行（fail-open），由数据库唯一索引 uk_idempotency_token 兜底。
  *   两层防护互相独立，任一层失效另一层仍然生效。</p>
  */
 @Slf4j

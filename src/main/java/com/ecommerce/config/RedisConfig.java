@@ -1,10 +1,9 @@
 package com.ecommerce.config;
 
+import org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer;
 import com.fasterxml.jackson.annotation.JsonAutoDetect;
-import com.fasterxml.jackson.annotation.JsonTypeInfo;
 import com.fasterxml.jackson.annotation.PropertyAccessor;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.jsontype.impl.LaissezFaireSubTypeValidator;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.fasterxml.jackson.datatype.jsr310.deser.LocalDateTimeDeserializer;
 import com.fasterxml.jackson.datatype.jsr310.ser.LocalDateTimeSerializer;
@@ -12,7 +11,6 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.data.redis.connection.RedisConnectionFactory;
 import org.springframework.data.redis.core.RedisTemplate;
-import org.springframework.data.redis.serializer.Jackson2JsonRedisSerializer;
 import org.springframework.data.redis.serializer.StringRedisSerializer;
 
 import java.time.LocalDateTime;
@@ -31,26 +29,25 @@ public class RedisConfig {
         RedisTemplate<String, Object> template = new RedisTemplate<>();
         template.setConnectionFactory(connectionFactory);
 
-        // String 序列化器（key）
         StringRedisSerializer stringSerializer = new StringRedisSerializer();
+        // 使用 GenericJackson2JsonRedisSerializer
+        GenericJackson2JsonRedisSerializer jsonSerializer = genericJackson2JsonRedisSerializer();
 
-        // Jackson JSON 序列化器（value）
-        Jackson2JsonRedisSerializer<Object> jacksonSerializer = jackson2JsonRedisSerializer();
-
-        // key 用 String
         template.setKeySerializer(stringSerializer);
         template.setHashKeySerializer(stringSerializer);
-
-        // value 用 Jackson
-        template.setValueSerializer(jacksonSerializer);
-        template.setHashValueSerializer(jacksonSerializer);
+        template.setValueSerializer(jsonSerializer);
+        template.setHashValueSerializer(jsonSerializer);
 
         template.afterPropertiesSet();
         return template;
     }
 
-    private Jackson2JsonRedisSerializer<Object> jackson2JsonRedisSerializer() {
-        Jackson2JsonRedisSerializer<Object> serializer = new Jackson2JsonRedisSerializer<>(Object.class);
+    private GenericJackson2JsonRedisSerializer genericJackson2JsonRedisSerializer() {
+        ObjectMapper objectMapper = createObjectMapper();
+        return new GenericJackson2JsonRedisSerializer(objectMapper);
+    }
+
+    private ObjectMapper createObjectMapper() {
         ObjectMapper objectMapper = new ObjectMapper();
 
         // Java 8 时间模块
@@ -60,16 +57,11 @@ public class RedisConfig {
         javaTimeModule.addDeserializer(LocalDateTime.class, new LocalDateTimeDeserializer(formatter));
         objectMapper.registerModule(javaTimeModule);
 
-        // 所有属性可见
+        // 注：类型信息（@class）由 GenericJackson2JsonRedisSerializer 自己负责写入/读取，
+        // 此处不要再调用 objectMapper.activateDefaultTyping(...)，否则会与 GenericJackson 重复写 @class，
+        // 个别版本还会抛 IllegalStateException: Cannot call activateDefaultTyping() more than once。
         objectMapper.setVisibility(PropertyAccessor.ALL, JsonAutoDetect.Visibility.ANY);
-        // 记录类型，用于反序列化
-        objectMapper.activateDefaultTyping(
-                LaissezFaireSubTypeValidator.instance,
-                ObjectMapper.DefaultTyping.NON_FINAL,
-                JsonTypeInfo.As.PROPERTY
-        );
 
-        serializer.setObjectMapper(objectMapper);
-        return serializer;
+        return objectMapper;
     }
 }

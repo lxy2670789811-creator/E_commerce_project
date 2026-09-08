@@ -11,6 +11,7 @@ frontend/dist/
 frontend/node_modules/
 perf/
 .workbuddy/
+work/
 
 # ===== Local env / secrets（密钥绝不提交）=====
 .env

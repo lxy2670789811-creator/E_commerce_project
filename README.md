@@ -135,7 +135,7 @@ java -jar app.jar --spring.profiles.active=prod
 4. **AI 售后降级**：动态开关 → Sentinel 慢调用/异常比例熔断 → Redis 滑动窗口限流（Lua 原子）→ Feign 熔断 → "待人工审核"兜底，AI 完全不可用时接口仍可用。
 5. **订单号唯一性**：`ORD + 秒级时间戳 + 完整雪花ID`，并发的订单号测试验证无重复。
 6. **JWT 鉴权（零依赖手写实现）**：登录签发 HMAC-SHA256 三段式 Token，`JwtAuthInterceptor` 解析后写入 `AuthContext`（ThreadLocal）传递身份，业务层取身份而非信任请求参数；请求结束 `clear()` 防线程池复用串号；`required` 开关支持兼容模式（缺 Token 放行），`allow-plain-text-login` 支持存量明文密码自动升级 BCrypt。
-7. **下单幂等凭证（防重复提交）**：`createOrder` 本身非幂等——防超卖只挡并发，挡不住时间分散的重复提交（双击/超时重发）。进入下单页 `GET /order/token` 领一次性凭证（绑定 userId+productId），提交时以 Lua 脚本原子"取出并删除"（GETDEL），二次提交因凭证已消耗被拒；Redis 故障 fail-open 放行，由数据库唯一索引 `uk_pending_unique` 兜底，两层防护相互独立。
+7. **下单幂等凭证（防重复提交）**：`createOrder` 本身非幂等——防超卖只挡并发，挡不住时间分散的重复提交（双击/超时重发）。进入下单页 `GET /order/token` 领一次性凭证（绑定 userId+productId），提交时以 Lua 脚本原子"取出并删除"（GETDEL），二次提交因凭证已消耗被拒；Redis 故障 fail-open 放行，由数据库唯一索引 `uk_idempotency_token` 兜底，两层防护相互独立。
 
 ## 项目结构
 
