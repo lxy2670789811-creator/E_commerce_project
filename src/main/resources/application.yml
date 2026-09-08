@@ -68,6 +68,8 @@ ecommerce:
     deepseek-error-ratio-threshold: 0.5     # Feign 异常比例熔断阈值
     # --- 缓存 ---
     product-detail-expire-seconds: 3600     # 商品详情缓存过期（秒）
+    product-detail-expire-jitter-seconds: 300   # 过期时间随机抖动上限（秒，防缓存雪崩；0=关闭）
+    product-detail-null-cache-expire-seconds: 120 # 空值缓存过期（秒，防缓存穿透；0=关闭）
     # --- 订单超时未支付自动关单（RocketMQ 延迟消息 + 定时扫描兜底） ---
     order-timeout-cancel-enabled: true      # 超时关单总开关
     order-timeout-cancel-delay-level: 9     # 延迟级别（9=5分钟，详见 BusinessDynamicConfig）

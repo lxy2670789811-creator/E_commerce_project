@@ -7,7 +7,7 @@
 
 | 模块 | 亮点 |
 | ---- | ---- |
-| 商品 | Cache-Aside 缓存（Redis 主动删缓存保证一致性）、逻辑删除、分页查询 |
+| 商品 | Cache-Aside 缓存（写后删缓存保一致性）、**空值缓存防穿透 + TTL 随机抖动防雪崩**、逻辑删除、分页查询 |
 | 订单 | **三层防超卖**：Sentinel 限流 → Redisson 按商品维度分布式锁 → DB 原子扣减（`stock >= quantity`） |
 | 订单 | 完整状态机：待支付 → 已支付 → 已发货 → 已完成 / 已取消（支付回调幂等） |
 | 订单 | **RocketMQ 延迟消息超时自动关单**（事务提交后发送，消费端幂等，库存回滚） |
@@ -92,13 +92,14 @@ npm run dev   # http://localhost:5173
 mvn test
 ```
 
-共 **35 个测试**，重点：
+共 **39 个测试**，重点：
 
 - `OrderConcurrencyIntegrationTest`：真实 MySQL + Redis 并发防超卖（40 线程抢 20 库存 → 恰好 20 单、库存归 0、无超卖）
 - `OrderServiceImplTest`：下单/取消/支付回调/发货/完成/超时关单等 21 个核心路径
 - `OrderNoGeneratorTest`：订单号格式 + 5 万连续/并发唯一性
 - `DeepSeekClientTest`：AI 解析、重试、降级
 - `AiRateLimiterTest`：限流放行/拒绝/Redis 故障降级
+- `ProductCacheNullMarkerTest`：缓存防护专项——空值标记序列化往返（防穿透能否生效的前提）、商品缓存类型还原不被误判、TTL 抖动区间与错峰效果、抖动开关
 
 > 集成测试使用独立测试库 `ecommerce_test`（自动创建）与 Redis DB15，不污染开发数据；
 > 测试 profile 已禁用 Nacos/Sentinel/RocketMQ，无需额外中间件。
@@ -130,12 +131,16 @@ java -jar app.jar --spring.profiles.active=prod
 
 1. **防超卖**：Sentinel 入口限流 → Redisson 按商品 ID 加锁（同商品串行）→ SQL `stock >= quantity` 原子扣减（DB 最终兜底）。
    锁在**事务提交/回滚后**释放（`TransactionSynchronization.afterCompletion`），避免"锁先释放、事务未提交"的并发窗口。
-2. **缓存一致性**：Cache-Aside + 写后删缓存（而非更新缓存），避免并发覆盖旧值；Redis 异常降级查库不影响主流程。
+2. **缓存一致性 + 三防**：Cache-Aside + 写后删缓存（而非更新缓存），避免并发覆盖旧值；Redis 异常降级查库不影响主流程。
+   - **防穿透**：DB 查不到（不存在 / 已逻辑删除）时写入短 TTL 空值标记（默认 120s），挡住同一个 productId 被反复打到数据库；
+   - **防雪崩**：TTL = 基础值 + `random[0, 300s]` 随机抖动，让批量 key 错峰过期，避免同一时刻集体失效、请求同时回源；
+   - 两个 TTL 均支持 Nacos 热更新，**置 0 即关闭对应防护**（紧急降级开关）。
 3. **超时自动关单**：下单事务提交后发送 RocketMQ 延迟消息（延迟级别可动态配置），消费端幂等关单、回滚库存；另配 `@Scheduled` 定时扫描兜底——周期扫描"仍为待支付且超过超时阈值"的订单并复用幂等关单，RocketMQ 不可用/消息丢失时仍能补偿关单，延迟消息与定时扫描互为双保险。
 4. **AI 售后降级**：动态开关 → Sentinel 慢调用/异常比例熔断 → Redis 滑动窗口限流（Lua 原子）→ Feign 熔断 → "待人工审核"兜底，AI 完全不可用时接口仍可用。
 5. **订单号唯一性**：`ORD + 秒级时间戳 + 完整雪花ID`，并发的订单号测试验证无重复。
 6. **JWT 鉴权（零依赖手写实现）**：登录签发 HMAC-SHA256 三段式 Token，`JwtAuthInterceptor` 解析后写入 `AuthContext`（ThreadLocal）传递身份，业务层取身份而非信任请求参数；请求结束 `clear()` 防线程池复用串号；`required` 开关支持兼容模式（缺 Token 放行），`allow-plain-text-login` 支持存量明文密码自动升级 BCrypt。
 7. **下单幂等凭证（防重复提交）**：`createOrder` 本身非幂等——防超卖只挡并发，挡不住时间分散的重复提交（双击/超时重发）。进入下单页 `GET /order/token` 领一次性凭证（绑定 userId+productId），提交时以 Lua 脚本原子"取出并删除"（GETDEL），二次提交因凭证已消耗被拒；Redis 故障 fail-open 放行，由数据库唯一索引 `uk_idempotency_token` 兜底，两层防护相互独立。
+8. **Redis 序列化陷阱（踩坑实录）**：`GenericJackson2JsonRedisSerializer` **只有在使用无参构造器时**才会自动注册 `@class` 类型信息；一旦传入自定义 `ObjectMapper`（本项目为了定制 `LocalDateTime` 格式），它就沿用该 mapper、不再开启多态类型处理 → 序列化出的 JSON 不带 `@class` → 反序列化回来是 `LinkedHashMap` → `(ProductVO) cached` 抛 `ClassCastException` → 又被"缓存异常降级查库"的 `catch` 悄悄吞掉。**表现为接口一切正常、但缓存 100% 未命中**。已在 `RedisConfig` 显式 `activateDefaultTyping(NON_FINAL, As.PROPERTY)` 修复，并用单元测试锁死该行为（String 等 final 类型不写 `@class`，空值缓存标记仍按纯字符串往返）。
 
 ## 项目结构
 

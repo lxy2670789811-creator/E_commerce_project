@@ -31,8 +31,10 @@ import org.springframework.stereotype.Component;
  *     ai-analyze-stat-interval-ms: 60000    # AI 熔断统计窗口
  *     ai-analyze-time-window: 30            # AI 熔断时长（秒）
  *     deepseek-error-ratio-threshold: 0.5   # Feign 异常比例熔断阈值
- *     # --- 缓存 ---
- *     product-detail-expire-seconds: 3600   # 商品详情缓存过期
+     *     # --- 缓存 ---
+     *     product-detail-expire-seconds: 3600            # 商品详情缓存过期（秒）
+     *     product-detail-expire-jitter-seconds: 300      # 过期时间随机抖动上限（秒，防雪崩）
+     *     product-detail-null-cache-expire-seconds: 120  # 空值缓存过期（秒，防穿透）
      *     # --- 订单超时关单（延迟消息 + 定时扫描兜底） ---
      *     order-timeout-cancel-enabled: true      # 超时关单总开关
      *     order-timeout-cancel-delay-level: 9     # 延迟级别（9=5分钟）
@@ -131,6 +133,23 @@ public class BusinessDynamicConfig {
      * 默认：3600秒（1小时）
      */
     private long productDetailExpireSeconds = 3600L;
+
+    /**
+     * 商品详情缓存过期时间的随机抖动上限（秒）—— 缓存雪崩防护
+     * 实际过期时间 = productDetailExpireSeconds + random[0, 本值]
+     * 默认：300秒（让 1 小时的缓存错峰落在 60~65 分钟内过期，避免批量 key 同时失效集体回源）
+     * 设为 0 = 关闭抖动（所有 key 严格同 TTL，仅用于压测对照）
+     */
+    private long productDetailExpireJitterSeconds = 300L;
+
+    /**
+     * 商品详情"空值缓存"过期时间（秒）—— 缓存穿透防护
+     * 商品不存在（含已被逻辑删除）时，仍写入一个短 TTL 的空标记，
+     * 防止同一个不存在的 productId 被反复打到数据库
+     * 默认：120秒（足够短，商品新增/恢复后最多 120s 即可见；足够长，能挡住扫描型流量）
+     * 设为 0 = 关闭空值缓存（紧急降级开关）
+     */
+    private long productDetailNullCacheExpireSeconds = 120L;
 
     // ====== 订单超时未支付自动关单（RocketMQ 延迟消息） ======
     /**
