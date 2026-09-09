@@ -1,20 +1,21 @@
 # 电商订单后端系统（e-commerce-order-backend）
 
 一个面向简历的 Java 后端电商订单系统，覆盖**商品、订单、用户、AI 售后**四大模块，
-沉淀了分布式锁防超卖、缓存一致性、多级降级、RocketMQ 延迟消息、分页、多环境配置与测试等工程实践。
+沉淀了分布式锁防超卖、缓存一致性（详情三防 + 列表缓存）、多级降级、RocketMQ 延迟消息、DB 连接池护栏调优、分页、多环境配置与测试等工程实践。
 
 ## 功能特性
 
 | 模块 | 亮点 |
 | ---- | ---- |
 | 商品 | Cache-Aside 缓存（写后删缓存保一致性）、**空值缓存防穿透 + TTL 随机抖动防雪崩 + Redisson 单飞(singleflight)防击穿**、逻辑删除、分页查询 |
+| 商品 | **默认首页商品流列表缓存**：对无筛选分页做 Redis 整页缓存（短 TTL 兜底一致性、空结果防穿透），写操作批量失效；带筛选查询走联合索引直查，避免 key 组合爆炸 |
 | 订单 | **三层防超卖**：Sentinel 限流 → Redisson 按商品维度分布式锁 → DB 原子扣减（`stock >= quantity`） |
 | 订单 | 完整状态机：待支付 → 已支付 → 已发货 → 已完成 / 已取消（支付回调幂等） |
 | 订单 | **RocketMQ 延迟消息超时自动关单**（事务提交后**异步发送**（asyncSend + SendCallback），消费端幂等，库存回滚；细粒度健康门控扫描 + 粗粒度强制对账双兜底） |
 | 用户 | **JWT 鉴权登录**：登录下发 Token，拦截器校验，`AuthContext`（ThreadLocal）传递身份，业务层取身份而非信任参数；收货地址管理（默认地址互斥） |
 | 订单 | **下单一次性凭证（幂等 Token）**：进入下单页 `GET /order/token` 领凭证、提交时 Lua 原子消耗（GETDEL），防双击/超时重试生成的重复订单与重复扣库存 |
 | AI 售后 | DeepSeek 大模型智能分析 + **五层保护**：动态开关 → Sentinel 熔断 → Redis 滑动窗口限流 → Feign 熔断 → 业务降级"待人工审核" |
-| 工程化 | 统一响应/全局异常、MapStruct、Knife4j 接口文档、Nacos 动态配置、多环境 profile、Docker Compose、39 个测试（含并发防超卖集成测试） |
+| 工程化 | 统一响应/全局异常、MapStruct、Knife4j 接口文档、Nacos 动态配置、多环境 profile、Docker Compose、**HikariCP 连接池护栏调优**、39 个测试（含并发防超卖集成测试） |
 
 ## 技术栈
 
@@ -100,6 +101,7 @@ mvn test
 - `DeepSeekClientTest`：AI 解析、重试、降级
 - `AiRateLimiterTest`：限流放行/拒绝/Redis 故障降级
 - `ProductCacheNullMarkerTest`：缓存防护专项——空值标记序列化往返（防穿透能否生效的前提）、商品缓存类型还原不被误判、TTL 抖动区间与错峰效果、抖动开关
+- `ProductCacheSingleflightTest`：缓存击穿防护专项——singleflight 互斥重建的 leader 只回源一次、并发请求复用 leader 结果、二次查缓存命中不查 DB、开关关闭退化直查
 
 > 集成测试使用独立测试库 `ecommerce_test`（自动创建）与 Redis DB15，不污染开发数据；
 > 测试 profile 已禁用 Nacos/Sentinel/RocketMQ，无需额外中间件。
@@ -145,6 +147,8 @@ java -jar app.jar --spring.profiles.active=prod
 6. **JWT 鉴权（零依赖手写实现）**：登录签发 HMAC-SHA256 三段式 Token，`JwtAuthInterceptor` 解析后写入 `AuthContext`（ThreadLocal）传递身份，业务层取身份而非信任请求参数；请求结束 `clear()` 防线程池复用串号；`required` 开关支持兼容模式（缺 Token 放行），`allow-plain-text-login` 支持存量明文密码自动升级 BCrypt。
 7. **下单幂等凭证（防重复提交）**：`createOrder` 本身非幂等——防超卖只挡并发，挡不住时间分散的重复提交（双击/超时重发）。进入下单页 `GET /order/token` 领一次性凭证（绑定 userId+productId），提交时以 Lua 脚本原子"取出并删除"（GETDEL），二次提交因凭证已消耗被拒；Redis 故障 fail-open 放行，由数据库唯一索引 `uk_idempotency_token` 兜底，两层防护相互独立。
 8. **Redis 序列化陷阱（踩坑实录）**：`GenericJackson2JsonRedisSerializer` **只有在使用无参构造器时**才会自动注册 `@class` 类型信息；一旦传入自定义 `ObjectMapper`（本项目为了定制 `LocalDateTime` 格式），它就沿用该 mapper、不再开启多态类型处理 → 序列化出的 JSON 不带 `@class` → 反序列化回来是 `LinkedHashMap` → `(ProductVO) cached` 抛 `ClassCastException` → 又被"缓存异常降级查库"的 `catch` 悄悄吞掉。**表现为接口一切正常、但缓存 100% 未命中**。已在 `RedisConfig` 显式 `activateDefaultTyping(NON_FINAL, As.PROPERTY)` 修复，并用单元测试锁死该行为（String 等 final 类型不写 `@class`，空值缓存标记仍按纯字符串往返）。
+9. **列表缓存：只缓存"能缓存"的列表**。商品列表筛选维度多（keyword/category/status + 翻页），若对任意组合都做整页缓存，key 空间组合爆炸、命中率趋近于零、且写操作失效困难（无法精确到某个商品改一次就要删海量 key）。因此本项目**只对无筛选的默认首页商品流**（组合固定为 page+size，承载最高流量）做 Cache-Aside 缓存，短 TTL（默认 120s）兜底一致性、空结果短缓存防穿透、6 个写操作后按前缀批量失效。带 keyword 自由搜索的列表不做整页缓存，改由**联合索引 `idx_list_query (deleted, status, category, create_time)` 兜底分页** + 限流。核心判断：**先分辨列表是否天然适合整页缓存，再决定缓存策略，比无脑加缓存更关键**。
+10. **DB 连接池护栏调优（HikariCP）**：压测暴露"连接池争用"时，先问"连接被谁占着不还"而非"再加多少条"。本项目的护栏策略——`maximum-pool-size` 收敛到合理值（prod 从 50 收到 15；每多一条连接 = MySQL 多一个线程，池过大反而放大上下文切换与 InnoDB 锁争用）、`connection-timeout` 调低到 3s（拿不到连接快速失败而非让线程在池上无限堆积，避免拖垮 Tomcat 线程池）、开启 `leak-detection-threshold=30s`（连接超时未归还在日志中打泄漏告警，用于定位长期占连接的慢 SQL/事务）。**连接池参数是护栏不是提速器**：真正减少 DB 连接占用靠"查询走索引 + 默认流走缓存"（见第 9 点），护栏负责在压力下快速失败、暴露问题。
 
 ## 项目结构
 

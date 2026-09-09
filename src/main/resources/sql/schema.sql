@@ -64,7 +64,12 @@ CREATE TABLE `product` (
     PRIMARY KEY (`id`),
     KEY `idx_status` (`status`),
     KEY `idx_category` (`category`),
-    KEY `idx_name` (`name`)
+    KEY `idx_name` (`name`),
+    -- 商品列表分页查询联合索引（缓解列表接口高并发打库导致 DB 连接池争用）：
+    -- 查询为 deleted=0 AND [status=?] AND [category=?] ORDER BY create_time DESC 分页。
+    -- 等值列 deleted/status/category 在前、排序列 create_time 在后，让优化器一次命中索引、
+    -- 按 create_time 有序取 offset 分页，避免 filesort + 回表扫全量。列顺序：等值在前、排序在后。
+    KEY `idx_list_query` (`deleted`, `status`, `category`, `create_time`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='商品表';
 
 -- ============================================================

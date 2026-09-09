@@ -7,9 +7,17 @@ spring:
     password: ${MYSQL_PASSWORD}
     hikari:
       pool-name: EcommerceHikariCP
-      minimum-idle: 10
-      maximum-pool-size: 50
-      connection-timeout: 30000
+      # 连接池不是越大越好：每多一条连接 = MySQL 多一个线程，会放大上下文切换与 InnoDB 锁争用。
+      # 经验公式 核心数*2 + 磁盘数。压测显示"连接不够用"通常是慢查询占着连接不还，
+      # 靠调大池子救不了慢查询，反而会让慢查询一起挤爆 MySQL。故收敛到合理值。
+      minimum-idle: 5
+      maximum-pool-size: 15        # 4~8 核实例 10~20 足够，别再用 50
+      connection-timeout: 3000     # 拿不到连接 3 秒快速失败，别让线程在池上无限堆积(堆积会拖垮 Tomcat 线程池)
+      validation-timeout: 1000     # 校验连接超时，须小于 connection-timeout
+      idle-timeout: 600000         # 空闲 10 分钟回收(须小于 max-lifetime)
+      max-lifetime: 1800000        # 连接上限 30 分钟强制轮换，防 MySQL 侧 wait_timeout 断连
+      leak-detection-threshold: 30000  # 连接超 30s 未归还打泄漏告警日志，用于定位"谁长期占连接"的慢查询/事务
+      connection-test-query: SELECT 1
 
   data:
     redis:

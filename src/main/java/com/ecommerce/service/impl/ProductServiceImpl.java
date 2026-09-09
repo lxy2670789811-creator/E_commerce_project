@@ -24,6 +24,7 @@ import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
+import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 
@@ -56,6 +57,15 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, ProductDO> im
     private static final String CACHE_KEY_PREFIX = "ecommerce:product:detail:";
     /** 重建锁前缀（缓存击穿防护的 singleflight 互斥锁，按 productId 维度加锁） */
     private static final String REBUILD_LOCK_KEY_PREFIX = "ecommerce:lock:rebuild:product:";
+    /** 默认首页商品流（无筛选）分页缓存前缀 */
+    private static final String LIST_CACHE_KEY_PREFIX = "ecommerce:product:list:";
+    /** 默认首页商品流缓存的 key 前缀（含冒号），用于写操作时按前缀批量失效 */
+    private static final String DEFAULT_LIST_CACHE_PREFIX = LIST_CACHE_KEY_PREFIX + "default:";
+    /**
+     * 仅缓存默认首页商品流的前 N 页，防止深翻页产生无限增长的 key（缓存命中率随翻页骤降，
+     * 前几页承载绝大多数流量，深翻页走 DB 直查 + 索引兜底更合理）。
+     */
+    private static final int DEFAULT_LIST_CACHE_MAX_PAGE = 50;
 
     /**
      * 空值缓存标记（缓存穿透防护）
@@ -76,6 +86,8 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, ProductDO> im
     public Long addProduct(ProductAddDTO dto) {
         ProductDO productDO = ProductConvert.INSTANCE.addDTOToDO(dto);
         this.save(productDO);
+        // 新增商品可能影响默认首页流，批量失效列表缓存
+        evictDefaultListCache();
         log.info("新增商品成功：productId={}, name={}", productDO.getId(), productDO.getName());
         return productDO.getId();
     }
@@ -90,6 +102,8 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, ProductDO> im
         this.updateById(productDO);
         // 更新商品后主动删除缓存（Cache-Aside：更新DB后删缓存，下次读自动回源）
         deleteProductCache(dto.getId());
+        // 商品信息变更可能影响默认首页流，批量失效列表缓存
+        evictDefaultListCache();
         log.info("修改商品成功：productId={}, 已清除缓存", dto.getId());
     }
 
@@ -102,6 +116,8 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, ProductDO> im
         this.removeById(id);
         // 删除商品后主动删除缓存
         deleteProductCache(id);
+        // 删除商品会改变默认首页流的记录，批量失效列表缓存
+        evictDefaultListCache();
         log.info("删除商品成功：productId={}, 已清除缓存", id);
     }
 
@@ -115,6 +131,8 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, ProductDO> im
         this.updateById(exist);
         // 状态变更后删除缓存
         deleteProductCache(dto.getId());
+        // 上下架会改变默认首页流的可见商品，批量失效列表缓存
+        evictDefaultListCache();
         log.info("商品上下架成功：productId={}, status={}, 已清除缓存", dto.getId(), dto.getStatus());
     }
 
@@ -144,6 +162,40 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, ProductDO> im
 
     @Override
     public PageResult<ProductVO> listProducts(String keyword, String category, Integer status, long page, long pageSize) {
+        long safePage = Math.max(page, 1);
+        long safePageSize = Math.min(Math.max(pageSize, 1), 100);
+
+        // 仅对"无筛选的默认首页商品流"走缓存：keyword/category/status 全为空 且 落在前 N 页。
+        // 为什么只在无筛选时缓存？keyword 是自由搜索词，带筛选的 key 组合会爆炸、命中率极低、
+        // 失效困难；而默认首页流组合固定(page+size)、承载最高流量，缓存命中率高、收益最大。
+        // 深翻页(超过 DEFAULT_LIST_CACHE_MAX_PAGE)或带筛选的查询走 DB 直查 + idx_list_query 索引兜底。
+        boolean cacheableDefault = businessDynamicConfig.isProductListCacheEnabled()
+                && !StringUtils.hasText(keyword)
+                && !StringUtils.hasText(category)
+                && status == null
+                && safePage <= DEFAULT_LIST_CACHE_MAX_PAGE;
+
+        if (cacheableDefault) {
+            PageResult<ProductVO> cached = getDefaultListFromCache(safePage, safePageSize);
+            if (cached != null) {
+                return cached;
+            }
+        }
+
+        // 缓存未命中(或本就不走缓存)：直查 DB
+        PageResult<ProductVO> result = queryProductPage(keyword, category, status, safePage, safePageSize);
+
+        // 回写默认流缓存(空结果走短 TTL 防穿透)
+        if (cacheableDefault) {
+            writeDefaultListToCache(safePage, safePageSize, result);
+        }
+        return result;
+    }
+
+    /**
+     * 构造商品分页查询并返回(不含缓存，供列表主流程复用)
+     */
+    private PageResult<ProductVO> queryProductPage(String keyword, String category, Integer status, long page, long pageSize) {
         LambdaQueryWrapper<ProductDO> wrapper = new LambdaQueryWrapper<>();
         if (StringUtils.hasText(keyword)) {
             wrapper.like(ProductDO::getName, keyword);
@@ -155,9 +207,79 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, ProductDO> im
             wrapper.eq(ProductDO::getStatus, status);
         }
         wrapper.orderByDesc(ProductDO::getCreateTime);
-        Page<ProductDO> p = new Page<>(Math.max(page, 1), Math.min(Math.max(pageSize, 1), 100));
+        Page<ProductDO> p = new Page<>(page, pageSize);
         Page<ProductDO> result = this.page(p, wrapper);
         return PageResult.of(result.convert(ProductConvert.INSTANCE::doToVO));
+    }
+
+    // ==================== 默认首页商品流列表缓存(Cache-Aside) ====================
+
+    /**
+     * 从缓存读取默认首页商品流某一页；未命中/异常返回 null(交由上层直查 DB)
+     */
+    @SuppressWarnings("unchecked")
+    private PageResult<ProductVO> getDefaultListFromCache(long page, long pageSize) {
+        String cacheKey = buildDefaultListKey(page, pageSize);
+        try {
+            Object cached = redisTemplate.opsForValue().get(cacheKey);
+            if (cached instanceof PageResult) {
+                return (PageResult<ProductVO>) cached;
+            }
+        } catch (Exception e) {
+            log.warn("读取商品列表缓存异常，降级查DB：key={}", cacheKey, e);
+        }
+        return null;
+    }
+
+    /**
+     * 回写默认首页商品流某一页缓存
+     * 空结果(total==0，如数据库还没有商品/翻过头)走更短的 TTL(防穿透)，有数据走正常 TTL。
+     * total==0 且空结果缓存被关闭(null-cache-expire<=0)时则不缓存空页，避免写入无价值的空缓存。
+     */
+    private void writeDefaultListToCache(long page, long pageSize, PageResult<ProductVO> result) {
+        String cacheKey = buildDefaultListKey(page, pageSize);
+        boolean isEmpty = result.getTotal() == 0 || result.getList() == null || result.getList().isEmpty();
+        try {
+            if (isEmpty) {
+                long nullExpire = businessDynamicConfig.getProductListNullCacheExpireSeconds();
+                if (nullExpire <= 0) {
+                    return; // 空结果缓存关闭
+                }
+                redisTemplate.opsForValue().set(cacheKey, result, nullExpire, TimeUnit.SECONDS);
+                log.debug("写入空商品列表缓存(防穿透)：key={}, expire={}s", cacheKey, nullExpire);
+            } else {
+                long expire = businessDynamicConfig.getProductListExpireSeconds();
+                redisTemplate.opsForValue().set(cacheKey, result, Math.max(expire, 1), TimeUnit.SECONDS);
+                log.debug("写入商品列表缓存：key={}, expire={}s", cacheKey, Math.max(expire, 1));
+            }
+        } catch (Exception e) {
+            log.warn("写入商品列表缓存异常，不影响主流程：key={}", cacheKey, e);
+        }
+    }
+
+    /**
+     * 构建默认首页商品流缓存 key
+     */
+    private String buildDefaultListKey(long page, long pageSize) {
+        return DEFAULT_LIST_CACHE_PREFIX + page + ":" + pageSize;
+    }
+
+    /**
+     * 写操作后失效所有默认首页商品流缓存(Cache-Aside：更新DB后删缓存)。
+     * 按前缀批量删除。默认流缓存 key 规模极小(每页一个 key、仅缓存前 DEFAULT_LIST_CACHE_MAX_PAGE 页)，
+     * 且写操作低频，KEYS + DEL 开销可忽略；用 KEYS 是为了正确走配置好的 String key 序列化，
+     * 避免手写原生 SCAN 在连接/编码上的坑。若未来列表 key 规模变大，可替换为 SCAN 分页删除。
+     */
+    private void evictDefaultListCache() {
+        try {
+            Set<String> keys = redisTemplate.keys(DEFAULT_LIST_CACHE_PREFIX + "*");
+            if (keys != null && !keys.isEmpty()) {
+                redisTemplate.delete(keys);
+                log.debug("已清除默认首页商品流缓存：{} 个 key", keys.size());
+            }
+        } catch (Exception e) {
+            log.warn("清除商品列表缓存异常", e);
+        }
     }
 
     @Override
@@ -175,6 +297,8 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, ProductDO> im
         if (affected == 1) {
             // 库存变更后删除缓存（Cache-Aside 策略：保证下次读取拿到最新库存）
             deleteProductCache(productId);
+            // 列表展示含库存，扣减后失效默认首页流缓存
+            evictDefaultListCache();
             return true;
         }
         return false;
@@ -185,6 +309,7 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, ProductDO> im
         int affected = productMapper.increaseStock(productId, quantity);
         if (affected == 1) {
             deleteProductCache(productId);
+            evictDefaultListCache();
             return true;
         }
         return false;

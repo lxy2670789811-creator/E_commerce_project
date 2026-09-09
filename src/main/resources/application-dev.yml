@@ -10,11 +10,15 @@ spring:
     password: ${MYSQL_PASSWORD:123456}
     hikari:
       pool-name: EcommerceHikariCP
+      # 压测连接池护栏：池收敛到合理值(连接不是越多越好，多了放大 MySQL 线程/锁争用)，
+      # 拿不到连接快速失败而非无限堆积，leak-detection 用于定位"谁长期占连接"。
       minimum-idle: 5
-      maximum-pool-size: 20
-      idle-timeout: 30000
+      maximum-pool-size: 10
+      idle-timeout: 600000
       max-lifetime: 1800000
-      connection-timeout: 30000
+      connection-timeout: 3000
+      validation-timeout: 1000
+      leak-detection-threshold: 30000
       connection-test-query: SELECT 1
 
   # Redis

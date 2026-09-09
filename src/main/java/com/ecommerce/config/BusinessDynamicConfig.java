@@ -39,6 +39,10 @@ import org.springframework.stereotype.Component;
      *     product-detail-rebuild-lock-lease-seconds: 10  # 重建锁自动释放超时（秒，防 leader 崩溃死锁）
      *     product-detail-rebuild-lock-max-retries: 50     # 重建等待重试次数
      *     product-detail-rebuild-lock-backoff-millis: 20 # 重建等待退避（毫秒）
+     *     # --- 商品列表缓存（默认首页无筛选商品流） ---
+     *     product-list-cache-enabled: true      # 列表缓存开关
+     *     product-list-expire-seconds: 120       # 列表缓存过期（秒，短 TTL 兜底一致性）
+     *     product-list-null-cache-expire-seconds: 30 # 空结果缓存过期（秒，防穿透；0=关闭）
      *     # --- 订单超时关单（延迟消息 + 定时扫描兜底） ---
      *     order-timeout-cancel-enabled: true      # 超时关单总开关
      *     order-timeout-cancel-delay-level: 9     # 延迟级别（9=5分钟）
@@ -186,6 +190,30 @@ public class BusinessDynamicConfig {
      * 默认：20毫秒
      */
     private long productDetailRebuildLockBackoffMillis = 20L;
+
+    // ====== 商品列表缓存（默认首页商品流） ======
+    // 说明：仅对"无筛选"的默认首页商品流（keyword/category/status 均为空）做整页缓存。
+    // 带 keyword 自由搜索/多条件任意组合的列表 key 会爆炸、命中率低、失效困难，故不做整页缓存，
+    // 那部分靠联合索引 idx_list_query + Sentinel 限流兜底。写操作会批量失效默认流缓存。
+    /**
+     * 商品列表缓存开关（默认首页无筛选商品流）
+     * true = 命中缓存直接返回分页结果；false = 直查 DB（紧急降级开关）
+     */
+    private boolean productListCacheEnabled = true;
+
+    /**
+     * 商品列表缓存过期时间（秒）
+     * 列表对时效性要求高（新增/改价/上下架后应尽快可见），默认 120 秒，
+     * 靠短 TTL 兜底一致性"脏读窗口"。
+     */
+    private long productListExpireSeconds = 120L;
+
+    /**
+     * 商品列表"空结果"缓存过期时间（秒）—— 防穿透
+     * 某页在 DB 中查不到数据(空列表/翻过头)时写短 TTL 空标记，挡住反复回源扫描。
+     * 默认 30 秒。设 0 = 关闭空结果缓存。
+     */
+    private long productListNullCacheExpireSeconds = 30L;
 
     // ====== 订单超时未支付自动关单（RocketMQ 延迟消息） ======
     /**
