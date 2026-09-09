@@ -75,7 +75,35 @@ public class OrderTimeoutScanScheduler {
             log.debug("RocketMQ 超时关单通道可用，定时扫描跳过（MQ 健康门控，避免常态周期查询）");
             return;
         }
-        log.info("RocketMQ 超时关单通道不可用，定时扫描接管超时订单补偿");
+        doScan("RocketMQ 超时关单通道不可用，定时扫描接管超时订单补偿");
+    }
+
+    /**
+     * 粗粒度对账兜底（独立于 MQ 健康状态，固定周期强制扫描）。
+     *
+     * <p>目的：堵住"异步发送在回调到达前 JVM 崩溃 / 消息静默丢失但健康标志未翻转"等极端窗口，
+     * 保证任何超时未支付订单最终一定被关单，不依赖发送端的健康标志 {@code lastSendSucceeded}。
+     * 频率较低（默认每 10 分钟），对 DB 压力可忽略，却足以在延迟消息主通道失效时兜底。
+     */
+    @Scheduled(cron = "#{@businessDynamicConfig.orderTimeoutScanCoarseCron}")
+    public void reconcileExpiredPendingOrders() {
+        if (!businessDynamicConfig.isOrderTimeoutCancelEnabled()) {
+            log.debug("超时关单总开关已关闭，粗粒度对账跳过");
+            return;
+        }
+        if (!businessDynamicConfig.isOrderTimeoutScanCoarseEnabled()) {
+            log.debug("粗粒度对账开关已关闭，跳过");
+            return;
+        }
+        doScan("粗粒度对账兜底：固定周期强制扫描超时未支付订单（独立于 MQ 健康状态）");
+    }
+
+    /**
+     * 扫描"仍为待支付且创建时间超过超时阈值"的订单并自动关单（补偿核心逻辑）。
+     * 由细粒度扫描（门控于 MQ 健康）与粗粒度独立对账（强制）共用。
+     */
+    private void doScan(String reason) {
+        log.info("{}", reason);
 
         LocalDateTime deadline = LocalDateTime.now().minusSeconds(businessDynamicConfig.getOrderTimeoutSeconds());
         List<OrderDO> expiredOrders = orderService.list(new LambdaQueryWrapper<OrderDO>()
@@ -88,7 +116,7 @@ public class OrderTimeoutScanScheduler {
         if (expiredOrders == null || expiredOrders.isEmpty()) {
             return;
         }
-        log.info("定时扫描命中 {} 笔超时未支付订单，开始补偿关单", expiredOrders.size());
+        log.info("扫描命中 {} 笔超时未支付订单，开始补偿关单", expiredOrders.size());
 
         int success = 0;
         for (OrderDO order : expiredOrders) {
@@ -97,10 +125,10 @@ public class OrderTimeoutScanScheduler {
                 orderService.autoCancelOrder(order.getId());
                 success++;
             } catch (Exception e) {
-                log.error("定时扫描补偿关单失败：orderId={}, orderNo={}",
+                log.error("补偿关单失败：orderId={}, orderNo={}",
                         order.getId(), order.getOrderNo(), e);
             }
         }
-        log.info("定时扫描补偿关单完成：成功 {} / {} 笔", success, expiredOrders.size());
+        log.info("补偿关单完成：成功 {} / {} 笔", success, expiredOrders.size());
     }
 }

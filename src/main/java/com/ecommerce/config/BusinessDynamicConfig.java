@@ -44,6 +44,8 @@ import org.springframework.stereotype.Component;
      *     order-timeout-cancel-delay-level: 9     # 延迟级别（9=5分钟）
      *     order-timeout-scan-enabled: true        # 定时扫描兜底开关
      *     order-timeout-scan-cron: "0 0/1 * * * ?" # 扫描 cron（等价每分钟）
+     *     order-timeout-scan-coarse-enabled: true # 粗粒度对账兜底开关（独立于 MQ 健康）
+     *     order-timeout-scan-coarse-cron: "0 0/10 * * * ?" # 粗粒度对账 cron（每10分钟，最终兜底）
      *     order-timeout-seconds: 300              # 超时阈值（秒）
      *     order-timeout-scan-batch-size: 100      # 单批处理上限
      *     # --- 下单幂等（一次性凭证） ---
@@ -222,6 +224,21 @@ public class BusinessDynamicConfig {
      * 定时扫描单批处理的最大订单数（防止单次任务积压过多拖垮线程）
      */
     private int orderTimeoutScanBatchSize = 100;
+
+    /**
+     * 粗粒度对账兜底开关（独立于 MQ 健康状态的固定周期强制扫描）
+     * true = 即使 RocketMQ 通道健康，也按 order-timeout-scan-coarse-cron 周期强制扫描超时订单，
+     *        用于兜底"异步发送在回调到达前 JVM 崩溃 / 消息静默丢失但健康标志未翻转"等极端窗口，
+     *        保证任何超时未支付订单最终一定被关单。
+     * 默认：true
+     */
+    private boolean orderTimeoutScanCoarseEnabled = true;
+
+    /**
+     * 粗粒度对账 cron 表达式（Spring 6 位格式，含秒）
+     * 默认：每 10 分钟执行一次（频率远低于主扫描，对 DB 压力可忽略，却足以在极端窗口下兜底）
+     */
+    private String orderTimeoutScanCoarseCron = "0 */10 * * * ?";
 
     // ====== 下单幂等（一次性凭证） ======
     /**
