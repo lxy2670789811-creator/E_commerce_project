@@ -70,6 +70,10 @@ ecommerce:
     product-detail-expire-seconds: 3600     # 商品详情缓存过期（秒）
     product-detail-expire-jitter-seconds: 300   # 过期时间随机抖动上限（秒，防缓存雪崩；0=关闭）
     product-detail-null-cache-expire-seconds: 120 # 空值缓存过期（秒，防缓存穿透；0=关闭）
+    product-detail-rebuild-lock-enabled: true    # 缓存击穿防护开关（singleflight 互斥重建）
+    product-detail-rebuild-lock-lease-seconds: 10 # 重建锁自动释放超时（秒，防 leader 崩溃死锁）
+    product-detail-rebuild-lock-max-retries: 50   # 重建等待重试次数
+    product-detail-rebuild-lock-backoff-millis: 20 # 重建等待退避（毫秒）
     # --- 订单超时未支付自动关单（RocketMQ 延迟消息 + 定时扫描兜底） ---
     order-timeout-cancel-enabled: true      # 超时关单总开关
     order-timeout-cancel-delay-level: 9     # 延迟级别（9=5分钟，详见 BusinessDynamicConfig）

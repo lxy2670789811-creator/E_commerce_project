@@ -35,6 +35,10 @@ import org.springframework.stereotype.Component;
      *     product-detail-expire-seconds: 3600            # 商品详情缓存过期（秒）
      *     product-detail-expire-jitter-seconds: 300      # 过期时间随机抖动上限（秒，防雪崩）
      *     product-detail-null-cache-expire-seconds: 120  # 空值缓存过期（秒，防穿透）
+     *     product-detail-rebuild-lock-enabled: true      # 缓存击穿防护开关（singleflight 互斥重建）
+     *     product-detail-rebuild-lock-lease-seconds: 10  # 重建锁自动释放超时（秒，防 leader 崩溃死锁）
+     *     product-detail-rebuild-lock-max-retries: 50     # 重建等待重试次数
+     *     product-detail-rebuild-lock-backoff-millis: 20 # 重建等待退避（毫秒）
      *     # --- 订单超时关单（延迟消息 + 定时扫描兜底） ---
      *     order-timeout-cancel-enabled: true      # 超时关单总开关
      *     order-timeout-cancel-delay-level: 9     # 延迟级别（9=5分钟）
@@ -150,6 +154,36 @@ public class BusinessDynamicConfig {
      * 设为 0 = 关闭空值缓存（紧急降级开关）
      */
     private long productDetailNullCacheExpireSeconds = 120L;
+
+    // ====== 缓存击穿防护（singleflight 互斥重建） ======
+    /**
+     * 商品详情"缓存击穿"防护开关（singleflight 互斥重建）
+     * true = 热点 key 过期瞬间，同一 productId 同一时刻只允许一个线程回源，
+     *        其余并发请求等待其完成后读缓存，避免数据库被打爆
+     * false = 关闭，退化为"查DB + 回写"（与改造前行为一致，紧急降级开关）
+     */
+    private boolean productDetailRebuildLockEnabled = true;
+
+    /**
+     * 重建锁持有超时（秒）—— 防止 leader 崩溃导致锁永不释放、该商品永远无法重建
+     * Redisson 会在超过该时长后自动释放锁（死锁保护）
+     * 默认：10秒（远大于正常回源耗时，仅在 DB 严重抖动时兜底）
+     */
+    private long productDetailRebuildLockLeaseSeconds = 10L;
+
+    /**
+     * 重建锁等待重试次数（缓存击穿防护）
+     * 未拿到锁的并发请求会轮询缓存、退避重试，直到 leader 重建完成或重试耗尽
+     * 默认：50次（配合退避时间约 1 秒预算，覆盖绝大多数正常回源耗时）
+     */
+    private int productDetailRebuildLockMaxRetries = 50;
+
+    /**
+     * 重建锁等待退避时间（毫秒，缓存击穿防护）
+     * 未拿到锁的并发请求每次重试前的休眠时长（错峰，避免所有等待者同时重试）
+     * 默认：20毫秒
+     */
+    private long productDetailRebuildLockBackoffMillis = 20L;
 
     // ====== 订单超时未支付自动关单（RocketMQ 延迟消息） ======
     /**

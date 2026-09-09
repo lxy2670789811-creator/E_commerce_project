@@ -18,6 +18,8 @@ import com.ecommerce.vo.product.ProductStockVO;
 import com.ecommerce.vo.product.ProductVO;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
@@ -41,7 +43,10 @@ import java.util.concurrent.TimeUnit;
  *     避免不存在的 / 已逻辑删除的商品被反复请求时，每个请求都穿透到数据库
  *   - 缓存雪崩防护：过期时间加随机抖动（base + random[0, jitter]），
  *     避免批量 key 在同一时刻失效、请求集体回源打爆数据库
- *   - 两个防护的 TTL 均可通过 Nacos 动态调整；置 0 即关闭对应防护（紧急降级开关）
+ *   - 缓存击穿防护：热点 key 过期的瞬间，用 Redisson 分布式锁做 singleflight（互斥重建），
+ *     同一 productId 同一时刻只允许一个线程回源，其余并发请求等待其完成后直接读缓存，
+ *     避免大量并发同时打到数据库。开关 / 超时 / 重试 / 退避均可通过 Nacos 动态调整
+ *   - 穿透与雪崩两个防护的 TTL 均可通过 Nacos 动态调整；置 0 即关闭对应防护（紧急降级开关）
  */
 @Slf4j
 @Service
@@ -49,6 +54,8 @@ import java.util.concurrent.TimeUnit;
 public class ProductServiceImpl extends ServiceImpl<ProductMapper, ProductDO> implements ProductService {
 
     private static final String CACHE_KEY_PREFIX = "ecommerce:product:detail:";
+    /** 重建锁前缀（缓存击穿防护的 singleflight 互斥锁，按 productId 维度加锁） */
+    private static final String REBUILD_LOCK_KEY_PREFIX = "ecommerce:lock:rebuild:product:";
 
     /**
      * 空值缓存标记（缓存穿透防护）
@@ -60,8 +67,10 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, ProductDO> im
 
     private final ProductMapper productMapper;
     private final RedisTemplate<String, Object> redisTemplate;
-    /** Nacos 动态配置：商品详情缓存过期时间可动态调整 */
+    /** Nacos 动态配置：商品详情缓存过期时间 / 防护开关可动态调整 */
     private final BusinessDynamicConfig businessDynamicConfig;
+    /** Redisson 分布式锁客户端：用于缓存击穿防护的 singleflight 互斥重建 */
+    private final RedissonClient redissonClient;
 
     @Override
     public Long addProduct(ProductAddDTO dto) {
@@ -129,26 +138,8 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, ProductDO> im
             return (ProductVO) cached;
         }
 
-        // 2. 缓存未命中，查 DB
-        ProductDO productDO = this.getById(id);
-        if (productDO == null) {
-            // 缓存穿透防护：查不到也要写一份短 TTL 的空值缓存。
-            // 否则不存在的 / 已逻辑删除的 productId 被高频请求时，每次都会打到数据库。
-            cacheNullResult(cacheKey, id);
-            throw new BusinessException(ErrorCode.PRODUCT_NOT_FOUND);
-        }
-        ProductVO vo = ProductConvert.INSTANCE.doToVO(productDO);
-
-        // 3. 回写缓存（过期时间 = 基础 TTL + 随机抖动，防缓存雪崩）
-        long expireSeconds = resolveExpireWithJitter();
-        try {
-            redisTemplate.opsForValue().set(cacheKey, vo, expireSeconds, TimeUnit.SECONDS);
-            log.debug("回写商品详情缓存：productId={}, expire={}s", id, expireSeconds);
-        } catch (Exception e) {
-            log.warn("写入 Redis 缓存异常，不影响主流程：productId={}", id, e);
-        }
-
-        return vo;
+        // 2. 缓存未命中：进入 singleflight 重建流程，防缓存击穿（热点 key 过期瞬间的并发回源）
+        return rebuildWithSingleFlight(id, cacheKey);
     }
 
     @Override
@@ -217,6 +208,139 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, ProductDO> im
         } catch (Exception e) {
             log.warn("删除 Redis 缓存异常：productId={}", productId, e);
         }
+    }
+
+    // ==================== 缓存击穿防护（singleflight 互斥重建） ====================
+
+    /**
+     * 缓存未命中时的 singleflight 重建（防缓存击穿）
+     *
+     * <p>热点商品缓存过期的瞬间，可能有大量并发请求同时 miss、同时回源，
+     * 导致数据库瞬时被打爆（缓存击穿）。这里用 Redisson 分布式锁实现 singleflight：
+     * 同一 productId 同一时刻只有一个线程真正回源重建（leader），
+     * 其余并发线程不回源，而是轮询等待 leader 写入缓存后直接读缓存、复用其结果。</p>
+     *
+     * <p>等价于 Go 标准库 singleflight 的语义：多个调用方对同一 key 的请求，只放行一个去执行，
+     * 其余调用方复用其结果。用分布式锁而非仅进程内锁，是因为本项目为多实例部署，
+     * 不同实例上的并发同样需要互斥（进程内锁只能防住单实例内的并发）。</p>
+     *
+     * <p>退化路径：若 leader 迟迟未完成（如 DB 严重抖动）导致重试耗尽，
+     * 则降级为直接查 DB 返回，不让请求无限阻塞（宁可短暂多查几次 DB，也不让接口挂起）。</p>
+     */
+    private ProductVO rebuildWithSingleFlight(Long id, String cacheKey) {
+        if (!businessDynamicConfig.isProductDetailRebuildLockEnabled()) {
+            // 开关关闭：退化为普通"查DB + 回写"，行为与改造前一致
+            return loadFromDbAndWriteCache(id, cacheKey);
+        }
+
+        String lockKey = REBUILD_LOCK_KEY_PREFIX + id;
+        RLock lock = redissonClient.getLock(lockKey);
+        long leaseSeconds = businessDynamicConfig.getProductDetailRebuildLockLeaseSeconds();
+        int maxRetries = businessDynamicConfig.getProductDetailRebuildLockMaxRetries();
+        long backoffMillis = businessDynamicConfig.getProductDetailRebuildLockBackoffMillis();
+
+        for (int attempt = 0; attempt <= maxRetries; attempt++) {
+            // 1. 每轮先重新读缓存：leader 可能已重建完成
+            Object cached = tryReadCache(cacheKey);
+            if (cached != null) {
+                if (isNullMarker(cached)) {
+                    throw new BusinessException(ErrorCode.PRODUCT_NOT_FOUND);
+                }
+                return (ProductVO) cached;
+            }
+
+            // 2. 缓存仍 miss：tryLock(0) 立即尝试成为 leader（不阻塞等待，拿不到就退避重试）
+            boolean locked = false;
+            try {
+                locked = lock.tryLock(0, leaseSeconds, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break; // 线程被中断，退出循环走最终降级
+            }
+
+            if (locked) {
+                try {
+                    // 3. 成为 leader：二次检查缓存（拿锁瞬间可能别的节点刚写完）
+                    Object cachedAgain = tryReadCache(cacheKey);
+                    if (cachedAgain != null) {
+                        if (isNullMarker(cachedAgain)) {
+                            throw new BusinessException(ErrorCode.PRODUCT_NOT_FOUND);
+                        }
+                        return (ProductVO) cachedAgain;
+                    }
+                    // 4. 真正回源重建
+                    return loadFromDbAndWriteCache(id, cacheKey);
+                } finally {
+                    if (lock.isHeldByCurrentThread()) {
+                        safeUnlock(lock, lockKey);
+                    }
+                }
+            }
+
+            // 5. 没拿到锁（leader 正在重建）：退避后重试读缓存，复用 leader 的结果
+            if (attempt < maxRetries) {
+                try {
+                    Thread.sleep(backoffMillis);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }
+
+        // 6. 重试耗尽（leader 迟迟未完成 / 锁异常）：降级直接查 DB 返回，避免请求无限阻塞
+        log.warn("singleflight 重建重试耗尽，降级直接查DB：productId={}", id);
+        return loadFromDbAndWriteCache(id, cacheKey);
+    }
+
+    /**
+     * 读取缓存，异常时返回 null（交由上层降级查 DB）
+     */
+    private Object tryReadCache(String cacheKey) {
+        try {
+            return redisTemplate.opsForValue().get(cacheKey);
+        } catch (Exception e) {
+            log.warn("singleflight 重建中读取缓存异常：key={}", cacheKey, e);
+            return null;
+        }
+    }
+
+    /**
+     * 安全释放 Redisson 锁（防止锁已过期自动释放后再次 unlock 抛 IllegalMonitorStateException）
+     */
+    private void safeUnlock(RLock lock, String lockKey) {
+        try {
+            lock.unlock();
+        } catch (IllegalMonitorStateException e) {
+            log.warn("释放重建锁异常（可能已过期自动释放）：lockKey={}", lockKey, e);
+        }
+    }
+
+    /**
+     * 查 DB 并回写缓存（缓存未命中时的统一回源逻辑）
+     *
+     * <p>被 singleflight 的 leader（拿锁者）和极端降级路径共用：
+     * DB 查不到（不存在 / 已逻辑删除）→ 写短 TTL 空值缓存（防穿透）后抛异常；
+     * 查到 → 转 VO 并回写（带随机抖动的过期时间，防雪崩）后返回。</p>
+     */
+    private ProductVO loadFromDbAndWriteCache(Long id, String cacheKey) {
+        ProductDO productDO = this.getById(id);
+        if (productDO == null) {
+            // 缓存穿透防护：查不到也要写一份短 TTL 的空值缓存，挡住重复穿透
+            cacheNullResult(cacheKey, id);
+            throw new BusinessException(ErrorCode.PRODUCT_NOT_FOUND);
+        }
+        ProductVO vo = ProductConvert.INSTANCE.doToVO(productDO);
+
+        // 回写缓存（过期时间 = 基础 TTL + 随机抖动，防缓存雪崩）
+        long expireSeconds = resolveExpireWithJitter();
+        try {
+            redisTemplate.opsForValue().set(cacheKey, vo, expireSeconds, TimeUnit.SECONDS);
+            log.debug("回写商品详情缓存：productId={}, expire={}s", id, expireSeconds);
+        } catch (Exception e) {
+            log.warn("写入 Redis 缓存异常，不影响主流程：productId={}", id, e);
+        }
+        return vo;
     }
 
     // ==================== 缓存穿透 / 雪崩 防护 ====================

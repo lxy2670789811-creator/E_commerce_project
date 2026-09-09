@@ -3,6 +3,7 @@ package com.ecommerce.service.impl;
 import com.ecommerce.config.BusinessDynamicConfig;
 import com.ecommerce.mapper.ProductMapper;
 import com.ecommerce.vo.product.ProductVO;
+import org.redisson.api.RedissonClient;
 import com.fasterxml.jackson.annotation.JsonAutoDetect;
 import com.fasterxml.jackson.annotation.PropertyAccessor;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -106,7 +107,8 @@ class ProductCacheNullMarkerTest {
         return new ProductServiceImpl(
                 Mockito.mock(ProductMapper.class),
                 Mockito.mock(RedisTemplate.class),
-                config);
+                config,
+                Mockito.mock(RedissonClient.class));
     }
 
     @Test
