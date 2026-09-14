@@ -7,7 +7,21 @@ spring:
     username: ${MYSQL_USERNAME:root}
     password: ${MYSQL_PASSWORD:123456}
     hikari:
-      maximum-pool-size: 30
+      pool-name: EcommerceHikariCPTest
+      # 与 dev / prod 口径对齐（原为 30，是"池越大越好"的旧思路残留）。
+      # 集成测试同样走真实 MySQL，池子过大只会让并发用例放大 InnoDB 锁争用与上下文切换，
+      # 测出来的东西反而不代表线上。connection-timeout 保持 3s 快速失败，
+      # 让"连接拿不到"直接暴露成失败，而不是无限堆积把用例拖到超时。
+      minimum-idle: 5
+      maximum-pool-size: 10
+      idle-timeout: 600000
+      max-lifetime: 1800000
+      connection-timeout: 3000
+      validation-timeout: 1000
+      connection-test-query: SELECT 1
+      # 刻意不开 leak-detection-threshold：下单流程是 @Transactional 包住 Redisson 锁等待，
+      # 并发用例里"拿着连接等锁"是预期行为（inventory-lock-wait-seconds: 30），
+      # 开了会刷一堆假泄漏告警，反而掩盖真问题。
   data:
     redis:
       host: localhost

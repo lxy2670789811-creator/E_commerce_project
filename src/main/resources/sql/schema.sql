@@ -69,7 +69,13 @@ CREATE TABLE `product` (
     -- 查询为 deleted=0 AND [status=?] AND [category=?] ORDER BY create_time DESC 分页。
     -- 等值列 deleted/status/category 在前、排序列 create_time 在后，让优化器一次命中索引、
     -- 按 create_time 有序取 offset 分页，避免 filesort + 回表扫全量。列顺序：等值在前、排序在后。
-    KEY `idx_list_query` (`deleted`, `status`, `category`, `create_time`)
+    -- ⚠️ 生效前提：deleted/status/category **三列都要给等值条件**。若跳过中间列（如默认首页流只有
+    --    deleted=0），MySQL 无法用索引顺序满足 ORDER BY create_time DESC，仍会 filesort。
+    KEY `idx_list_query` (`deleted`, `status`, `category`, `create_time`),
+    -- 无筛选默认首页流（最高频路径，被列表缓存覆盖，但缓存 miss 时回源的就是它）专用：
+    -- 查询形状为 deleted=0 ORDER BY create_time DESC，实测走本索引可消除 filesort
+    -- （Backward index scan）。这是 idx_list_query 覆盖不到的场景，故单列一条。
+    KEY `idx_deleted_create` (`deleted`, `create_time`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='商品表';
 
 -- ============================================================

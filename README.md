@@ -8,14 +8,14 @@
 | 模块 | 亮点 |
 | ---- | ---- |
 | 商品 | Cache-Aside 缓存（写后删缓存保一致性）、**空值缓存防穿透 + TTL 随机抖动防雪崩 + Redisson 单飞(singleflight)防击穿**、逻辑删除、分页查询 |
-| 商品 | **默认首页商品流列表缓存**：对无筛选分页做 Redis 整页缓存（短 TTL 兜底一致性、空结果防穿透），写操作批量失效；带筛选查询走联合索引直查，避免 key 组合爆炸 |
+| 商品 | **默认首页商品流列表缓存**：对无筛选分页做 Redis 整页缓存（短 TTL 兜底一致性、空结果防穿透），写操作对版本号 key 自增一次即整体失效（**O(1)，不用 `KEYS` 扫描键空间**）；带筛选查询走联合索引直查，避免 key 组合爆炸 |
 | 订单 | **三层防超卖**：Sentinel 限流 → Redisson 按商品维度分布式锁 → DB 原子扣减（`stock >= quantity`） |
 | 订单 | 完整状态机：待支付 → 已支付 → 已发货 → 已完成 / 已取消（支付回调幂等） |
 | 订单 | **RocketMQ 延迟消息超时自动关单**（事务提交后**异步发送**（asyncSend + SendCallback），消费端幂等，库存回滚；细粒度健康门控扫描 + 粗粒度强制对账双兜底） |
 | 用户 | **JWT 鉴权登录**：登录下发 Token，拦截器校验，`AuthContext`（ThreadLocal）传递身份，业务层取身份而非信任参数；收货地址管理（默认地址互斥） |
 | 订单 | **下单一次性凭证（幂等 Token）**：进入下单页 `GET /order/token` 领凭证、提交时 Lua 原子消耗（GETDEL），防双击/超时重试生成的重复订单与重复扣库存 |
 | AI 售后 | DeepSeek 大模型智能分析 + **五层保护**：动态开关 → Sentinel 熔断 → Redis 滑动窗口限流 → Feign 熔断 → 业务降级"待人工审核" |
-| 工程化 | 统一响应/全局异常、MapStruct、Knife4j 接口文档、Nacos 动态配置、多环境 profile、Docker Compose、**HikariCP 连接池护栏调优**、39 个测试（含并发防超卖集成测试） |
+| 工程化 | 统一响应/全局异常、MapStruct、Knife4j 接口文档、Nacos 动态配置、多环境 profile、Docker Compose、**HikariCP 连接池护栏调优**、49 个测试（含并发防超卖集成测试） |
 
 ## 技术栈
 
@@ -72,6 +72,17 @@ java -jar target/e-commerce-order-backend-1.0.0.jar
 
 初始化数据库（首次）：执行 `src/main/resources/sql/schema.sql`（建库建表 + 演示数据）。
 
+> ⚠️ **`schema.sql` 只对"全新的空库"生效，不会影响已经存在的数据库。**
+> 它只在两种情况被执行：① `docker-compose.yml` 把它挂到 `/docker-entrypoint-initdb.d/`，由 MySQL 镜像在数据目录为空时跑一次；
+> ② 有人手工执行。而且脚本里是 `DROP TABLE IF EXISTS` 破坏性重建，已存在数据的库不能直接跑。
+> **因此凡新增索引/字段，除了改 `schema.sql`，还必须另写一条迁移脚本并手工执行一次**，见下一节。
+
+增量变更：`src/main/resources/sql/migration/` 下的脚本按文件名日期顺序执行，可重复执行（幂等）：
+
+```bash
+mysql -uroot -p ecommerce < src/main/resources/sql/migration/V20260914_01__add_product_list_index.sql
+```
+
 ### 5. 启动前端
 
 ```bash
@@ -90,13 +101,13 @@ npm run dev   # http://localhost:5173
 ## 测试
 
 ```bash
-mvn test
+mvn clean test
 ```
 
-共 **39 个测试**，重点：
+共 **49 个测试**，重点：
 
 - `OrderConcurrencyIntegrationTest`：真实 MySQL + Redis 并发防超卖（40 线程抢 20 库存 → 恰好 20 单、库存归 0、无超卖）
-- `OrderServiceImplTest`：下单/取消/支付回调/发货/完成/超时关单等 21 个核心路径
+- `OrderServiceImplTest`：下单/取消/支付回调/发货/完成/超时关单等 22 个核心路径
 - `OrderNoGeneratorTest`：订单号格式 + 5 万连续/并发唯一性
 - `DeepSeekClientTest`：AI 解析、重试、降级
 - `AiRateLimiterTest`：限流放行/拒绝/Redis 故障降级
@@ -105,6 +116,14 @@ mvn test
 
 > 集成测试使用独立测试库 `ecommerce_test`（自动创建）与 Redis DB15，不污染开发数据；
 > 测试 profile 已禁用 Nacos/Sentinel/RocketMQ，无需额外中间件。
+>
+> **务必带 `clean`**：本项目踩过两次「增量编译/Schema 漂移骗过测试」的坑——
+> ① `ProductServiceImpl` 的构造器加了 `StringRedisTemplate` 后，两个缓存测试类连编译都过不了，
+> 但 Maven 增量编译见 `.class` 比 `.java` 新便直接跳过，老字节码照旧执行，直到运行期才抛 `NoSuchMethodError`；
+> ② 测试库由 `schema-test.sql` 建表，原用 `CREATE TABLE IF NOT EXISTS`，
+> 对已存在的表完全无效 → 脚本加了 `idempotency_token` 列而库里永远没有，
+> 并发用例全部报 `Unknown column`。现该脚本已改为 `DROP TABLE IF EXISTS` + `CREATE TABLE`，
+> 保证每次上下文启动库结构与脚本严格一致。
 
 ## 多环境配置
 
@@ -113,6 +132,11 @@ mvn test
 | `dev`（默认） | `application-dev.yml` | 本地开发：localhost 中间件、SQL 日志、debug 日志 |
 | `prod` | `application-prod.yml` | 生产：敏感配置必须环境变量注入、关闭 SQL 日志 |
 | `test` | `src/test/resources/application-test.yml` | 测试专用（独立库 + 禁外部中间件） |
+
+> 三个环境的 HikariCP 口径一致：`maximum-pool-size` dev/test 为 **10**、prod 为 **15**
+> （原值分别为 20 / 30 / 50，均按「连接池不是越大越好」收敛），并统一 `connection-timeout: 3000` 快速失败。
+> test 环境刻意不开 `leak-detection-threshold`：下单事务包住 Redisson 锁等待，
+> 并发用例里「拿着连接等锁」是预期行为，开了会刷假泄漏告警。
 
 ```bash
 # 生产环境启动
@@ -147,8 +171,9 @@ java -jar app.jar --spring.profiles.active=prod
 6. **JWT 鉴权（零依赖手写实现）**：登录签发 HMAC-SHA256 三段式 Token，`JwtAuthInterceptor` 解析后写入 `AuthContext`（ThreadLocal）传递身份，业务层取身份而非信任请求参数；请求结束 `clear()` 防线程池复用串号；`required` 开关支持兼容模式（缺 Token 放行），`allow-plain-text-login` 支持存量明文密码自动升级 BCrypt。
 7. **下单幂等凭证（防重复提交）**：`createOrder` 本身非幂等——防超卖只挡并发，挡不住时间分散的重复提交（双击/超时重发）。进入下单页 `GET /order/token` 领一次性凭证（绑定 userId+productId），提交时以 Lua 脚本原子"取出并删除"（GETDEL），二次提交因凭证已消耗被拒；Redis 故障 fail-open 放行，由数据库唯一索引 `uk_idempotency_token` 兜底，两层防护相互独立。
 8. **Redis 序列化陷阱（踩坑实录）**：`GenericJackson2JsonRedisSerializer` **只有在使用无参构造器时**才会自动注册 `@class` 类型信息；一旦传入自定义 `ObjectMapper`（本项目为了定制 `LocalDateTime` 格式），它就沿用该 mapper、不再开启多态类型处理 → 序列化出的 JSON 不带 `@class` → 反序列化回来是 `LinkedHashMap` → `(ProductVO) cached` 抛 `ClassCastException` → 又被"缓存异常降级查库"的 `catch` 悄悄吞掉。**表现为接口一切正常、但缓存 100% 未命中**。已在 `RedisConfig` 显式 `activateDefaultTyping(NON_FINAL, As.PROPERTY)` 修复，并用单元测试锁死该行为（String 等 final 类型不写 `@class`，空值缓存标记仍按纯字符串往返）。
-9. **列表缓存：只缓存"能缓存"的列表**。商品列表筛选维度多（keyword/category/status + 翻页），若对任意组合都做整页缓存，key 空间组合爆炸、命中率趋近于零、且写操作失效困难（无法精确到某个商品改一次就要删海量 key）。因此本项目**只对无筛选的默认首页商品流**（组合固定为 page+size，承载最高流量）做 Cache-Aside 缓存，短 TTL（默认 120s）兜底一致性、空结果短缓存防穿透、6 个写操作后按前缀批量失效。带 keyword 自由搜索的列表不做整页缓存，改由**联合索引 `idx_list_query (deleted, status, category, create_time)` 兜底分页** + 限流。核心判断：**先分辨列表是否天然适合整页缓存，再决定缓存策略，比无脑加缓存更关键**。
+9. **列表缓存：只缓存"能缓存"的列表**。商品列表筛选维度多（keyword/category/status + 翻页），若对任意组合都做整页缓存，key 空间组合爆炸、命中率趋近于零、且写操作失效困难（无法精确到某个商品改一次就要删海量 key）。因此本项目**只对无筛选的默认首页商品流**（组合固定为 page+size，承载最高流量）做 Cache-Aside 缓存，短 TTL（默认 120s）兜底一致性、空结果短缓存防穿透、6 个写操作后只需对版本号 key 自增一次（O(1)）即让全部分页整体失效。带 keyword 自由搜索的列表不做整页缓存，改由**联合索引 `idx_list_query (deleted, status, category, create_time)` 兜底分页** + 限流。核心判断：**先分辨列表是否天然适合整页缓存，再决定缓存策略，比无脑加缓存更关键**。
 10. **DB 连接池护栏调优（HikariCP）**：压测暴露"连接池争用"时，先问"连接被谁占着不还"而非"再加多少条"。本项目的护栏策略——`maximum-pool-size` 收敛到合理值（prod 从 50 收到 15；每多一条连接 = MySQL 多一个线程，池过大反而放大上下文切换与 InnoDB 锁争用）、`connection-timeout` 调低到 3s（拿不到连接快速失败而非让线程在池上无限堆积，避免拖垮 Tomcat 线程池）、开启 `leak-detection-threshold=30s`（连接超时未归还在日志中打泄漏告警，用于定位长期占连接的慢 SQL/事务）。**连接池参数是护栏不是提速器**：真正减少 DB 连接占用靠"查询走索引 + 默认流走缓存"（见第 9 点），护栏负责在压力下快速失败、暴露问题。
+11. **`KEYS` 前缀扫描 → 版本号失效（性能踩坑实录）**：列表缓存的写后失效最初用 `redisTemplate.keys("...default:*")` + 批量 `DEL`。问题在于 `KEYS` 的复杂度 O(N) 里的 N 是**整个 Redis 实例的键空间**（不只是匹配到的那些 key），且 Redis 单线程模型下会阻塞其它所有命令。而该失效动作被**库存扣减路径**调用 —— 每成功下一单就触发一次，是高频热路径。实测（灌入 2 万键空间后重跑单线程顺序下单）：**单笔下单延迟 24ms → 30ms（+25%），劣化幅度随键空间线性增长**。改法：**版本号失效** —— 读路径把版本号拼进缓存 key（`...:default:v{ver}:{page}:{size}`），写路径对版本号 key 执行一次 `INCR`。版本号一变全部旧 key 即刻不可达，**O(1)、单条命令、零扫描**；旧 key 不再被读取，靠自身 TTL 自然过期，无需主动清理。两个关键细节：①版本号 key **不设过期时间**，若被意外清除则用**随机基数**重新播种（而非固定回落 0，否则可能与历史版本号重合而读到过期数据 —— 宁可多查一次 DB，不可读到过期数据）；②必须用 `StringRedisTemplate` 而非项目里那个 JSON 序列化的 `RedisTemplate`，后者写入的数字会被包成带 `@class` 的 JSON，原生 `INCR` 无法解析。
 
 ## 项目结构
 

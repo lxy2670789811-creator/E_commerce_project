@@ -1,10 +1,24 @@
--- 测试库建表脚本：与主 schema.sql 保持一致，但使用 IF NOT EXISTS，避免重复执行报错
--- 由 spring.sql.init 在每次测试上下文启动时执行（幂等）
+-- 测试库建表脚本：与主 schema.sql 保持一致
+-- 由 spring.sql.init 在每次测试上下文启动时执行
+--
+-- 【为什么是 DROP + CREATE 而不是 IF NOT EXISTS】
+-- 原实现用 CREATE TABLE IF NOT EXISTS，导致脚本对"已存在的表"完全无效：
+-- 曾经出过 ecommerce_test.orders 缺 idempotency_token 列，脚本里明明写了这一列，
+-- 但因为表早就存在，IF NOT EXISTS 直接跳过 → 建表脚本改了、库永远不变 →
+-- 并发下单集成测试全部报 Unknown column 'idempotency_token'，排查半天才发现是 schema 漂移。
+-- 测试库本来就是一次性的（用例自己 TRUNCATE 全部表），所以这里显式 DROP，
+-- 保证"每次上下文启动，库结构与脚本严格一致"，杜绝同类漂移复发。
 CREATE DATABASE IF NOT EXISTS ecommerce_test DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
 USE ecommerce_test;
 
-CREATE TABLE IF NOT EXISTS `sys_user` (
+DROP TABLE IF EXISTS `orders`;
+DROP TABLE IF EXISTS `user_address`;
+DROP TABLE IF EXISTS `product`;
+DROP TABLE IF EXISTS `sys_user`;
+DROP TABLE IF EXISTS `ai_after_support`;
+
+CREATE TABLE `sys_user` (
     `id`          BIGINT       NOT NULL AUTO_INCREMENT COMMENT '用户ID',
     `username`    VARCHAR(64)  NOT NULL COMMENT '用户名',
     `password`    VARCHAR(128) NOT NULL DEFAULT '$2a$10$43zntPUfCGS3fihhvF9VAew0XnfnXlUU0Xz8d3k0xCdm9IutfyPjC' COMMENT '密码（BCrypt哈希，测试用户明文均为123456）',
@@ -18,7 +32,7 @@ CREATE TABLE IF NOT EXISTS `sys_user` (
     UNIQUE KEY `uk_username` (`username`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='用户表';
 
-CREATE TABLE IF NOT EXISTS `user_address` (
+CREATE TABLE `user_address` (
     `id`           BIGINT       NOT NULL AUTO_INCREMENT COMMENT '地址ID',
     `user_id`      BIGINT       NOT NULL COMMENT '用户ID',
     `receiver`     VARCHAR(64)  NOT NULL COMMENT '收货人姓名',
@@ -35,7 +49,7 @@ CREATE TABLE IF NOT EXISTS `user_address` (
     KEY `idx_user_id` (`user_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='用户地址表';
 
-CREATE TABLE IF NOT EXISTS `product` (
+CREATE TABLE `product` (
     `id`           BIGINT          NOT NULL AUTO_INCREMENT COMMENT '商品ID',
     `name`         VARCHAR(255)    NOT NULL COMMENT '商品名称',
     `description`  TEXT                     DEFAULT NULL COMMENT '商品描述',
@@ -50,10 +64,14 @@ CREATE TABLE IF NOT EXISTS `product` (
     PRIMARY KEY (`id`),
     KEY `idx_status` (`status`),
     KEY `idx_category` (`category`),
-    KEY `idx_name` (`name`)
+    KEY `idx_name` (`name`),
+    -- 与 schema.sql 保持一致：商品列表分页查询的联合索引
+    KEY `idx_list_query` (`deleted`, `status`, `category`, `create_time`),
+    -- 无筛选默认首页流（WHERE deleted=0 ORDER BY create_time DESC）消除 filesort 专用
+    KEY `idx_deleted_create` (`deleted`, `create_time`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='商品表';
 
-CREATE TABLE IF NOT EXISTS `orders` (
+CREATE TABLE `orders` (
     `id`              BIGINT          NOT NULL AUTO_INCREMENT COMMENT '订单ID',
     `order_no`        VARCHAR(64)     NOT NULL COMMENT '订单号',
     `user_id`         BIGINT          NOT NULL COMMENT '用户ID',
@@ -85,7 +103,7 @@ CREATE TABLE IF NOT EXISTS `orders` (
     KEY `idx_status_create_time` (`status`, `create_time`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='订单表';
 
-CREATE TABLE IF NOT EXISTS `ai_after_support` (
+CREATE TABLE `ai_after_support` (
     `id`            BIGINT       NOT NULL AUTO_INCREMENT COMMENT '主键ID',
     `order_id`      BIGINT       NOT NULL COMMENT '订单ID',
     `order_no`      VARCHAR(64)  NOT NULL COMMENT '订单号',

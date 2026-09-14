@@ -11,6 +11,7 @@ import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer;
 import org.springframework.test.util.ReflectionTestUtils;
 
@@ -107,6 +108,9 @@ class ProductCacheNullMarkerTest {
         return new ProductServiceImpl(
                 Mockito.mock(ProductMapper.class),
                 Mockito.mock(RedisTemplate.class),
+                // 第 3 个依赖：列表缓存版本号用的 StringRedisTemplate。
+                // 本用例只测详情缓存的 TTL，不触发版本号逻辑，mock 占位即可。
+                Mockito.mock(StringRedisTemplate.class),
                 config,
                 Mockito.mock(RedissonClient.class));
     }

@@ -13,6 +13,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
 import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ValueOperations;
 
 import java.util.concurrent.TimeUnit;
@@ -53,6 +54,13 @@ class ProductCacheSingleflightTest {
     private RedissonClient redissonClient;
     @Mock
     private RLock lock;
+    /**
+     * 列表缓存版本号用的 StringRedisTemplate（ProductServiceImpl 的第 3 个依赖）。
+     * 本用例只覆盖详情缓存分支，不会走到版本号逻辑，因此仅需一个 mock 占位——
+     * 但绝不能少：少了就是 4 参构造，运行期直接 NoSuchMethodError。
+     */
+    @Mock
+    private StringRedisTemplate stringRedisTemplate;
 
     private ProductServiceImpl service;
 
@@ -63,7 +71,7 @@ class ProductCacheSingleflightTest {
         config.setProductDetailRebuildLockLeaseSeconds(10);
         config.setProductDetailRebuildLockMaxRetries(2);
         config.setProductDetailRebuildLockBackoffMillis(1);
-        service = spy(new ProductServiceImpl(productMapper, redisTemplate, config, redissonClient));
+        service = spy(new ProductServiceImpl(productMapper, redisTemplate, stringRedisTemplate, config, redissonClient));
 
         when(redisTemplate.opsForValue()).thenReturn(valueOps);
     }
@@ -141,7 +149,7 @@ class ProductCacheSingleflightTest {
     void disabledSwitchDegradesToPlainReload() throws InterruptedException {
         BusinessDynamicConfig config = new BusinessDynamicConfig();
         config.setProductDetailRebuildLockEnabled(false);
-        service = spy(new ProductServiceImpl(productMapper, redisTemplate, config, redissonClient));
+        service = spy(new ProductServiceImpl(productMapper, redisTemplate, stringRedisTemplate, config, redissonClient));
         when(redisTemplate.opsForValue()).thenReturn(valueOps);
         when(valueOps.get(anyString())).thenReturn(null);
         doReturnSample(4L);

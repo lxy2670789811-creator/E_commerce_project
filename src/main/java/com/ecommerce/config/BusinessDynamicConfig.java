@@ -194,7 +194,9 @@ public class BusinessDynamicConfig {
     // ====== 商品列表缓存（默认首页商品流） ======
     // 说明：仅对"无筛选"的默认首页商品流（keyword/category/status 均为空）做整页缓存。
     // 带 keyword 自由搜索/多条件任意组合的列表 key 会爆炸、命中率低、失效困难，故不做整页缓存，
-    // 那部分靠联合索引 idx_list_query + Sentinel 限流兜底。写操作会批量失效默认流缓存。
+    // 那部分靠联合索引 idx_list_query + Sentinel 限流兜底。
+    // 写操作通过对版本号 key（ecommerce:product:list:default:version）执行一次 INCR 来失效
+    // 全部分页缓存：O(1)、单条命令、不扫描键空间（历史上曾用 KEYS 前缀扫描，会阻塞 Redis 主线程）。
     /**
      * 商品列表缓存开关（默认首页无筛选商品流）
      * true = 命中缓存直接返回分页结果；false = 直查 DB（紧急降级开关）
