@@ -6,6 +6,18 @@ spring:
   application:
     name: e-commerce-order-backend
 
+  # --- 优雅停机最长等待（云原生 L0）---
+  # 含义：从发出停机信号到容器真正关闭的总预算，包含在途请求处理与 Bean 销毁。
+  # 取值依据：本应用最慢的两条链路 ——
+  #   下单：Redisson 锁等待上限 5s（inventory-lock-wait-seconds）+ 事务执行 → 远小于 30s，安全；
+  #   AI 售后：Feign readTimeout 就是 30s → 恰好卡在边界。
+  # ⚠️ 已知边界（刻意不改，记录在案）：AI 链路恰好跑满 30s 时会被截断。
+  #    可接受的原因：该接口有 fallback 降级（返回 null → 走人工审核），且属辅助功能非交易主链路。
+  #    若要彻底覆盖，正确做法是先把 AI 的 readTimeout 从 30s 收敛到 10~15s，而不是把这里调大 ——
+  #    停机等待越久，滚动更新就越慢，Pod 数多时一次发布要拖很久。
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+
   # Jackson
   jackson:
     date-format: yyyy-MM-dd HH:mm:ss
@@ -16,6 +28,17 @@ server:
   port: 8080
   servlet:
     context-path: /api
+  # --- 优雅停机（云原生 L0）---
+  # graceful：收到 SIGTERM 后先停止接收新请求，等"在途请求"处理完再关闭容器。
+  # Spring Boot 默认是 immediate —— 立刻关闭 Tomcat，正在执行的下单请求会被硬切，
+  # 对"扣库存 + 写订单 + 发延迟消息"这种多步操作存在中间态风险。
+  #
+  # ⚠️ 必须与 K8s 侧配合，否则配置形同虚设：
+  #    Pod spec 的 terminationGracePeriodSeconds 必须 > spring.lifecycle.timeout-per-shutdown-phase，
+  #    建议 45s（30s 停机 + 15s 收尾余量）。否则在途请求还没跑完就被 SIGKILL。
+  #    另外 preStop 建议 sleep 5~10s：K8s 发 SIGTERM 与 Endpoint 从 Service 摘除是并行的，
+  #    不等待的话仍会有新请求被打到正在停机的 Pod 上。
+  shutdown: graceful
 
 # MyBatis-Plus（环境相关的 SQL 日志在 dev/prod 中配置）
 mybatis-plus:
@@ -118,3 +141,42 @@ feign:
         connectTimeout: 5000
         readTimeout: 30000
         loggerLevel: FULL
+
+# ==================== 云原生 L0：Actuator 与 K8s 探针 ====================
+# 端点路径（注意 context-path=/api，探针 URL 必须带上它）：
+#   存活探针  GET /api/actuator/health/liveness
+#   就绪探针  GET /api/actuator/health/readiness
+#
+# ⚠️ 两个探针的语义不能混 —— 这是最容易配错、后果也最严重的一处：
+#   liveness  = "进程是不是卡死了"，失败 → K8s 重启容器
+#   readiness = "现在能不能接流量"，失败 → K8s 只把 Pod 从 Service 摘掉，不重启
+#   所以 DB / Redis / RocketMQ 的健康度只能进 readiness。
+#   一旦把 Redis 连通性放进 liveness，Redis 抖一下 K8s 就会把**所有** Pod 重启 ——
+#   本来只是"暂时不可用"，会被放大成"全站崩溃"。
+management:
+  endpoints:
+    web:
+      exposure:
+        # L0 只开健康检查与基本信息。metrics / prometheus / env / beans 留到 L3 再开，
+        # 它们会暴露线程池配置、环境变量等内部信息，不适合默认放行。
+        include: health,info
+  endpoint:
+    health:
+      probes:
+        enabled: true      # 启用 liveness / readiness 分组（默认只有聚合的 /health）
+      show-details: never  # 探针端点不返回 DB 地址、磁盘用量等内部细节
+  health:
+    livenessstate:
+      enabled: true
+    readinessstate:
+      enabled: true
+  info:
+    env:
+      enabled: true        # 发布后可通过 /api/actuator/info 核对跑的是哪个 profile
+
+# 端口取舍（刻意不与业务端口分离）：
+#   管理端点与业务共用 8080，外部访问由 Ingress 的路径规则拦截 /actuator。
+#   分离端口（management.server.port）确实更安全 —— Service 只暴露业务端口、
+#   探针走 Pod IP 直连管理端口，集群内其它 Pod 都访问不到。
+#   但本项目是单体内部系统，Knife4j 文档本来就开在 8080，health 又不返回细节，
+#   同端口省一个要管的端口，收益大于成本。将来若要公网暴露，再改分离端口。

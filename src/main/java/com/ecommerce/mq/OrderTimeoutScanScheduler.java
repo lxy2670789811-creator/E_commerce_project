@@ -9,9 +9,12 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 /**
  * 订单超时未支付自动关单 - 定时扫描兜底（补偿机制）
@@ -40,6 +43,16 @@ import java.util.List;
  *   <li>{@code order-timeout-seconds}：超时阈值（秒），建议 ≥ RocketMQ 延迟级别对应时长；</li>
  *   <li>{@code order-timeout-scan-batch-size}：单批处理上限。</li>
  * </ul>
+ *
+ * <p><b>多副本选主（云原生 L0）</b>：本任务是 {@code @Scheduled}，多副本部署时每个 Pod 都会触发。
+ * 后果要说清楚：<b>不会造成业务错误</b> —— {@code autoCancelOrder} 只处理待支付订单，
+ * 已关掉的单会被幂等跳过，不会重复回滚库存。真正的问题是①同一批订单被 N 个 Pod 重复扫描、
+ * DB 查询放大 N 倍；②MQ 健康门控 {@code isRocketMqUsable()} 是<b>实例本地标志</b>，
+ * "A 的 MQ 挂了所以 A 在扫、B 正常所以 B 不扫"，扫描日志分散在不同 Pod，排查要逐个翻。
+ * 因此执行前先用 Redisson 抢一把全局锁，抢到才扫，一轮只由一个副本执行。
+ *
+ * <p>为什么用 Redisson 而不是 ShedLock / K8s CronJob：项目已引入 Redisson（库存锁、缓存重建锁都用它），
+ * 零新增依赖；ShedLock 要加一张表；CronJob 要拆代码另做镜像，对这个体量偏重。
  */
 @Slf4j
 @Component
@@ -48,9 +61,26 @@ import java.util.List;
 // order-timeout-scan-enabled（兜底任务专属开关）与 MQ 健康门控在任务内运行时判断。
 public class OrderTimeoutScanScheduler {
 
+    /** 扫描选主锁：多副本同时只有一个能拿到，拿到才执行本轮扫描 */
+    private static final String SCAN_LOCK_KEY = "ecommerce:lock:scheduler:order-timeout-scan";
+
+    /**
+     * 选主锁的租约（秒）。
+     *
+     * <p>取值要大于"单轮扫描耗时"，否则锁提前过期、另一副本会重复扫（虽然幂等无害，但失去选主意义）。
+     * 单轮耗时 = 查一批（默认 100 条）+ 逐条关单（每笔自带事务与库存锁等待），常态秒级完成；
+     * 60s 对默认 batch-size 留了充足余量。
+     *
+     * <p>这里刻意<b>不做成 Nacos 热配置</b>：与库存锁那些业务参数不同，调度锁的 lease 只在任务触发时读一次，
+     * 运行期调整没有实际价值，反而多一个要维护和口头解释的参数。
+     * ⚠️ 若把 {@code order-timeout-scan-batch-size} 调到很大（比如上万），需同步调大此值。
+     */
+    private static final long SCAN_LOCK_LEASE_SECONDS = 60L;
+
     private final OrderService orderService;
     private final BusinessDynamicConfig businessDynamicConfig;
     private final OrderTimeoutCancelSender orderTimeoutCancelSender;
+    private final RedissonClient redissonClient;
 
     /**
      * 周期扫描超时未支付订单并自动关单
@@ -75,7 +105,7 @@ public class OrderTimeoutScanScheduler {
             log.debug("RocketMQ 超时关单通道可用，定时扫描跳过（MQ 健康门控，避免常态周期查询）");
             return;
         }
-        doScan("RocketMQ 超时关单通道不可用，定时扫描接管超时订单补偿");
+        runWithLeaderLock("RocketMQ 超时关单通道不可用，定时扫描接管超时订单补偿");
     }
 
     /**
@@ -95,7 +125,48 @@ public class OrderTimeoutScanScheduler {
             log.debug("粗粒度对账开关已关闭，跳过");
             return;
         }
-        doScan("粗粒度对账兜底：固定周期强制扫描超时未支付订单（独立于 MQ 健康状态）");
+        runWithLeaderLock("粗粒度对账兜底：固定周期强制扫描超时未支付订单（独立于 MQ 健康状态）");
+    }
+
+    /**
+     * 多副本选主：抢到全局锁的副本才执行本轮扫描，抢不到就直接跳过。
+     *
+     * <p><b>为什么 waitTime 传 0（不等待）—— 与缓存重建锁的"有限等待"方向相反</b>：
+     * 缓存重建是"必须拿到结果才能返回请求"，所以要有限等待、随时接替 leader；
+     * 定时扫描是"这一轮谁做都行，做不了等下一轮"。若在这里排队等待，
+     * 会让 N 个副本<b>串行</b>执行同一批任务 —— 既无收益，还可能把执行拖到下一个 cron 周期之外。
+     *
+     * <p>{@code tryLock} 声明了 {@link InterruptedException}，被中断时放弃本轮（等下个周期），
+     * 不向上抛 —— 抛出去会被 Spring 调度线程池吞掉并打一屏堆栈，没有意义。
+     */
+    private void runWithLeaderLock(String reason) {
+        RLock lock = redissonClient.getLock(SCAN_LOCK_KEY);
+        boolean acquired;
+        try {
+            acquired = lock.tryLock(0, SCAN_LOCK_LEASE_SECONDS, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.warn("定时扫描选主被中断，放弃本轮执行（lockKey={}）", SCAN_LOCK_KEY);
+            return;
+        }
+        if (!acquired) {
+            log.debug("本轮扫描由其它副本执行，当前副本跳过（lockKey={}）", SCAN_LOCK_KEY);
+            return;
+        }
+        try {
+            doScan(reason);
+        } finally {
+            if (lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            } else {
+                // 租约已过期：锁被 Redis 自动释放，此时 unlock 会抛 IllegalMonitorStateException，必须跳过。
+                // 这个分支要记 warn 而不是静默跳过 —— 频繁出现说明单轮扫描耗时超过了 lease，
+                // 选主已经失效（会有第二个副本进来重复扫），需要调大 SCAN_LOCK_LEASE_SECONDS 或调小 batch-size。
+                log.warn("扫描锁租约已过期，跳过释放（lockKey={}, lease={}s）；" +
+                                "若频繁出现说明单轮扫描耗时超过 lease，选主已失效",
+                        SCAN_LOCK_KEY, SCAN_LOCK_LEASE_SECONDS);
+            }
+        }
     }
 
     /**

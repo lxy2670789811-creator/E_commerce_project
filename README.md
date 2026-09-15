@@ -15,7 +15,8 @@
 | 用户 | **JWT 鉴权登录**：登录下发 Token，拦截器校验，`AuthContext`（ThreadLocal）传递身份，业务层取身份而非信任参数；收货地址管理（默认地址互斥） |
 | 订单 | **下单一次性凭证（幂等 Token）**：进入下单页 `GET /order/token` 领凭证、提交时 Lua 原子消耗（GETDEL），防双击/超时重试生成的重复订单与重复扣库存 |
 | AI 售后 | DeepSeek 大模型智能分析 + **五层保护**：动态开关 → Sentinel 熔断 → Redis 滑动窗口限流 → Feign 熔断 → 业务降级"待人工审核" |
-| 工程化 | 统一响应/全局异常、MapStruct、Knife4j 接口文档、Nacos 动态配置、多环境 profile、Docker Compose、**HikariCP 连接池护栏调优**、57 个测试（含并发防超卖集成测试） |
+| 工程化 | 统一响应/全局异常、MapStruct、Knife4j 接口文档、Nacos 动态配置、多环境 profile、Docker Compose、**HikariCP 连接池护栏调优**、61 个测试（含并发防超卖集成测试） |
+| 云原生 | **容器化就绪（L0）**：Actuator 存活/就绪探针、**优雅停机**、**定时扫描多副本 Redisson 选主**、非 root 运行的多阶段镜像；应用本身无状态（JWT + Redis 锁/限流 + 无本地缓存与文件），可直接水平扩缩 |
 
 ## 技术栈
 
@@ -104,7 +105,7 @@ npm run dev   # http://localhost:5173
 mvn clean test
 ```
 
-共 **57 个测试**，重点：
+共 **61 个测试**，重点：
 
 - `OrderConcurrencyIntegrationTest`：真实 MySQL + Redis 并发防超卖（40 线程抢 20 库存 → 恰好 20 单、库存归 0、无超卖）
 - `OrderServiceImplTest`：下单/取消/支付回调/发货/完成/超时关单等 22 个核心路径
@@ -114,6 +115,7 @@ mvn clean test
 - `AiRateLimiterTest`：限流放行/拒绝/Redis 故障降级
 - `ProductCacheNullMarkerTest`：缓存防护专项——空值标记序列化往返（防穿透能否生效的前提）、商品缓存类型还原不被误判、TTL 抖动区间与错峰效果、抖动开关
 - `ProductCacheSingleflightTest`：缓存击穿防护专项——singleflight 互斥重建的 leader 只回源一次、并发请求复用 leader 结果、二次查缓存命中不查 DB、开关关闭退化直查、**总等待时长被预算硬约束（既等满、又不超）**、**降级并发闸门满载时快速失败且不触达 DB**（含"上限配 0 = 不封顶"的对照）、**租约丢失被计数且跳过 unlock**
+- `OrderTimeoutScanSchedulerLeaderElectionTest`：**多副本选主**——抢到锁才扫描并释放、抢不到锁**连 DB 查询都不发生**（这是"不再重复扫描"的直接证据）、租约过期时跳过 `unlock()` 且不抛 `IllegalMonitorStateException`、抢锁被中断则放弃本轮。已做变异验证：去掉选主的 `return` 后准确报红
 
 > 集成测试使用独立测试库 `ecommerce_test`（自动创建）与 Redis DB15，不污染开发数据；
 > 测试 profile 已禁用 Nacos/Sentinel/RocketMQ，无需额外中间件。
@@ -175,6 +177,14 @@ java -jar app.jar --spring.profiles.active=prod
 9. **列表缓存：只缓存"能缓存"的列表**。商品列表筛选维度多（keyword/category/status + 翻页），若对任意组合都做整页缓存，key 空间组合爆炸、命中率趋近于零、且写操作失效困难（无法精确到某个商品改一次就要删海量 key）。因此本项目**只对无筛选的默认首页商品流**（组合固定为 page+size，承载最高流量）做 Cache-Aside 缓存，短 TTL（默认 120s）兜底一致性、空结果短缓存防穿透、6 个写操作后只需对版本号 key 自增一次（O(1)）即让全部分页整体失效。带 keyword 自由搜索的列表不做整页缓存，改由**联合索引 `idx_list_query (deleted, status, category, create_time)` 兜底分页** + 限流。核心判断：**先分辨列表是否天然适合整页缓存，再决定缓存策略，比无脑加缓存更关键**。
 10. **DB 连接池护栏调优（HikariCP）**：压测暴露"连接池争用"时，先问"连接被谁占着不还"而非"再加多少条"。本项目的护栏策略——`maximum-pool-size` 收敛到合理值（prod 从 50 收到 15；每多一条连接 = MySQL 多一个线程，池过大反而放大上下文切换与 InnoDB 锁争用）、`connection-timeout` 调低到 3s（拿不到连接快速失败而非让线程在池上无限堆积，避免拖垮 Tomcat 线程池）、开启 `leak-detection-threshold=30s`（连接超时未归还在日志中打泄漏告警，用于定位长期占连接的慢 SQL/事务）。**连接池参数是护栏不是提速器**：真正减少 DB 连接占用靠"查询走索引 + 默认流走缓存"（见第 9 点），护栏负责在压力下快速失败、暴露问题。
 11. **`KEYS` 前缀扫描 → 版本号失效（性能踩坑实录）**：列表缓存的写后失效最初用 `redisTemplate.keys("...default:*")` + 批量 `DEL`。问题在于 `KEYS` 的复杂度 O(N) 里的 N 是**整个 Redis 实例的键空间**（不只是匹配到的那些 key），且 Redis 单线程模型下会阻塞其它所有命令。而该失效动作被**库存扣减路径**调用 —— 每成功下一单就触发一次，是高频热路径。实测（灌入 2 万键空间后重跑单线程顺序下单）：**单笔下单延迟 24ms → 30ms（+25%），劣化幅度随键空间线性增长**。改法：**版本号失效** —— 读路径把版本号拼进缓存 key（`...:default:v{ver}:{page}:{size}`），写路径对版本号 key 执行一次 `INCR`。版本号一变全部旧 key 即刻不可达，**O(1)、单条命令、零扫描**；旧 key 不再被读取，靠自身 TTL 自然过期，无需主动清理。两个关键细节：①版本号 key **不设过期时间**，若被意外清除则用**随机基数**重新播种（而非固定回落 0，否则可能与历史版本号重合而读到过期数据 —— 宁可多查一次 DB，不可读到过期数据）；②必须用 `StringRedisTemplate` 而非项目里那个 JSON 序列化的 `RedisTemplate`，后者写入的数字会被包成带 `@class` 的 JSON，原生 `INCR` 无法解析。
+
+12. **容器化就绪 / 云原生 L0（K8s 适配）**：本项目能直接上 K8s，前提是应用**天然无状态**——JWT 无 Session、锁与限流都在 Redis（Redisson / Lua）、无本地缓存、无本地文件存储，因此 Pod 可任意扩缩与漂移，不需要 sticky session 或共享存储。在此之上补了三处 K8s 必需的集成：
+    - **探针语义必须分开**（最容易配错的一处）：`/api/actuator/health/liveness` 只判"进程是否卡死"，失败 → K8s 重启容器；`/api/actuator/health/readiness` 才包含 DB/Redis/MQ 健康度，失败 → K8s **只把 Pod 摘出 Service，不重启**。把 Redis 连通性塞进 liveness 的后果是：Redis 抖一下，K8s 重启**所有** Pod，把"暂时不可用"放大成"全站崩溃"。
+    - **优雅停机**：`server.shutdown=graceful` + `spring.lifecycle.timeout-per-shutdown-phase=30s`。Spring Boot 默认 immediate 会立刻关闭 Tomcat，正在执行的下单请求（扣库存 + 写订单 + 发延迟消息）被硬切就可能出现中间态。⚠️ 必须与 K8s 的 `terminationGracePeriodSeconds`（建议 45s）配合，否则在途请求没跑完就被 SIGKILL。已知边界：AI 链路 Feign `readTimeout` 就是 30s、恰好卡在边界，但接口有 fallback 降级且非交易主链路，接受；正确解法是收敛 AI 超时而不是调大停机等待（等待越久滚动更新越慢）。
+    - **定时扫描多副本选主**：`OrderTimeoutScanScheduler` 的两个 `@Scheduled` 在多副本下会各跑一遍。抢不到 Redisson 全局锁的副本直接跳过本轮。注意这里 `tryLock` 的 **waitTime 传 0（不等待）**，与缓存重建锁的"有限等待"**方向相反**——缓存重建是"必须拿到结果才能返回请求"，定时扫描是"这一轮谁做都行"，若排队等待会让 N 个副本串行执行同一批任务。
+
+> **已完成到哪一步**：L0（容器化就绪）已在代码中落地；L1（K8s 编排：Deployment/Service/Ingress/HPA）与 L2（中间件上云）尚未开始，
+> 中间件目前仍由 `docker-compose.yml` 编排。完整的可行性与工程量评估见 `work/云原生改造可行性与工程量评估.html`。
 
 ## 项目结构
 

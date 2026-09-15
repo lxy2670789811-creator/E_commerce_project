@@ -176,6 +176,18 @@
             <artifactId>spring-boot-starter-aop</artifactId>
         </dependency>
 
+        <!-- ==================== 云原生 L0：健康检查与优雅停机 ====================
+             Actuator 提供 /actuator/health/liveness 与 /actuator/health/readiness，
+             供 K8s 的存活探针与就绪探针使用。没有它，Deployment 只能做 TCP 端口探测，
+             无法区分"进程还活着"与"已经可以接流量"（Nacos 配置未拉到、连接池未建好时端口已在监听）。
+             优雅停机（server.shutdown=graceful）本身由 Spring Boot 提供、不需要额外依赖，
+             但探针是它的前提：K8s 要先通过 readiness 把 Pod 摘出 Service，停机才不会断在途请求。
+             注意：L0 阶段刻意不引 micrometer-registry-prometheus，指标导出留到 L3 可观测性阶段再开。 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+
         <!-- 3. OpenFeign 声明式 HTTP 客户端 -->
         <dependency>
             <groupId>org.springframework.cloud</groupId>
