@@ -4,8 +4,10 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.ecommerce.common.BusinessException;
-import com.ecommerce.common.PageResult;
 import com.ecommerce.common.ErrorCode;
+import com.ecommerce.common.PageResult;
+import com.ecommerce.common.RebuildDegradeLimiter;
+import com.ecommerce.common.metrics.RebuildLockMetrics;
 import com.ecommerce.config.BusinessDynamicConfig;
 import com.ecommerce.convert.ProductConvert;
 import com.ecommerce.dto.product.ProductAddDTO;
@@ -46,7 +48,9 @@ import java.util.concurrent.TimeUnit;
  *     避免批量 key 在同一时刻失效、请求集体回源打爆数据库
  *   - 缓存击穿防护：热点 key 过期的瞬间，用 Redisson 分布式锁做 singleflight（互斥重建），
  *     同一 productId 同一时刻只允许一个线程回源，其余并发请求等待其完成后直接读缓存，
- *     避免大量并发同时打到数据库。开关 / 超时 / 重试 / 退避均可通过 Nacos 动态调整
+ *     避免大量并发同时打到数据库。等待以"总时长预算"硬约束（不是重试次数），
+ *     预算耗尽则降级查 DB，且降级并发有封顶、超出快速失败（防止保护失效时把并发成倍放给 DB）。
+ *     开关 / 租约 / 等待总预算 / 等待片长 / 降级并发上限均可通过 Nacos 动态调整
  *   - 穿透与雪崩两个防护的 TTL 均可通过 Nacos 动态调整；置 0 即关闭对应防护（紧急降级开关）
  *   - 默认首页商品流列表缓存的失效方式：**版本号失效**（而非按前缀批量删除）。
  *     读：把当前版本号拼进 key（...:default:v{ver}:{page}:{pageSize}）；
@@ -109,6 +113,17 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, ProductDO> im
     private final BusinessDynamicConfig businessDynamicConfig;
     /** Redisson 分布式锁客户端：用于缓存击穿防护的 singleflight 互斥重建 */
     private final RedissonClient redissonClient;
+    /** singleflight 重建的运行指标（预算耗尽率、降级拒绝数、租约丢失数、回源耗时） */
+    private final RebuildLockMetrics rebuildLockMetrics;
+
+    /**
+     * 降级回源的并发闸门：预算耗尽后允许同时查 DB 的请求数上限。
+     *
+     * <p>纯内存计数、无外部依赖，因此直接字段初始化而不走 Spring 注入——
+     * 多一个构造参数就要同步改所有 new ProductServiceImpl(...) 的测试，
+     * 而这个对象没有任何需要容器装配的东西。</p>
+     */
+    private final RebuildDegradeLimiter degradeLimiter = new RebuildDegradeLimiter();
 
     @Override
     public Long addProduct(ProductAddDTO dto) {
@@ -437,14 +452,38 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, ProductDO> im
      * <p>热点商品缓存过期的瞬间，可能有大量并发请求同时 miss、同时回源，
      * 导致数据库瞬时被打爆（缓存击穿）。这里用 Redisson 分布式锁实现 singleflight：
      * 同一 productId 同一时刻只有一个线程真正回源重建（leader），
-     * 其余并发线程不回源，而是轮询等待 leader 写入缓存后直接读缓存、复用其结果。</p>
+     * 其余并发线程不回源，而是等待 leader 写入缓存后直接读缓存、复用其结果。</p>
      *
      * <p>等价于 Go 标准库 singleflight 的语义：多个调用方对同一 key 的请求，只放行一个去执行，
      * 其余调用方复用其结果。用分布式锁而非仅进程内锁，是因为本项目为多实例部署，
      * 不同实例上的并发同样需要互斥（进程内锁只能防住单实例内的并发）。</p>
      *
-     * <p>退化路径：若 leader 迟迟未完成（如 DB 严重抖动）导致重试耗尽，
-     * 则降级为直接查 DB 返回，不让请求无限阻塞（宁可短暂多查几次 DB，也不让接口挂起）。</p>
+     * <p><b>等待策略：总时长预算（deadline），而不是"重试次数"。</b>
+     * 早期版本用 {@code maxRetries × backoffMillis} 控制等待，但"次数"约束不了时间——
+     * 每轮除退避之外还要发一次 Redis 读，真实耗时 = N×backoff + N×RTT，
+     * Redis 一抖动就会显著超出配置意图（注释写"约 1 秒预算"，实测可到 2 秒）。
+     * 现在改为用单调时钟 {@code System.nanoTime()} 算出绝对截止时间，
+     * 等待时长由 {@code product-detail-rebuild-lock-budget-millis} 硬约束：
+     * 每轮开始先算"距截止还剩多少"，等待片长取"剩余预算"与"本轮退避"的较小值，
+     * 因此总耗时恒 ≤ 预算，与退避策略怎么调都无关（预算配 0 即关闭等待、立即降级）。</p>
+     *
+     * <p><b>为什么用锁的有限等待，而不是 {@code Thread.sleep} 轮询？</b>
+     * 锁一旦释放（leader 正常完成 / 抛异常 / 租约到期），等待者会被立即唤醒，
+     * 可以第一时间接替成为新 leader 继续重建，而不必干等满一个退避周期；
+     * 同时 {@code Thread.sleep} 从热路径上消失。
+     * 注意 Redisson 的语义：被唤醒但抢锁失败的一方仍要等到本次片长结束才返回，
+     * 所以<b>片长必须保持在一个典型回源的量级（默认 20ms 起步），不能拿整个预算当等待时长</b>——
+     * 那样等待者会白等一整个预算，延迟反而比轮询更差。这里用"指数增长 + 抖动"兼顾两者：
+     * 前几轮片长很短（反应快），后几轮翻倍（避免在 leader 卡死时反复订阅造成 Redis 命令放大）。</p>
+     *
+     * <p><b>退化路径：预算耗尽（leader 迟迟未完成，如 DB 严重抖动）则降级查 DB，
+     * 但降级本身受并发闸门封顶</b>（{@code ...-degrade-max-concurrency}）。
+     * 单纯"降级直查 DB"会把 singleflight 刚挡住的并发在保护失效的瞬间成倍放出去，
+     * 若 DB 本就慢，正反馈会拖垮整个服务；因此降级路径必须是"有界放行 + 超出快速失败"，
+     * 而不是无限制放行或返回兜底假数据。详见 {@link #degradeToDb}。</p>
+     *
+     * <p>运行指标（预算耗尽率、降级拒绝数、租约丢失数、回源耗时）由
+     * {@link RebuildLockMetrics} 累计，可通过其 {@code snapshot()} 读取。</p>
      */
     private ProductVO rebuildWithSingleFlight(Long id, String cacheKey) {
         if (!businessDynamicConfig.isProductDetailRebuildLockEnabled()) {
@@ -454,62 +493,158 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, ProductDO> im
 
         String lockKey = REBUILD_LOCK_KEY_PREFIX + id;
         RLock lock = redissonClient.getLock(lockKey);
-        long leaseSeconds = businessDynamicConfig.getProductDetailRebuildLockLeaseSeconds();
-        int maxRetries = businessDynamicConfig.getProductDetailRebuildLockMaxRetries();
-        long backoffMillis = businessDynamicConfig.getProductDetailRebuildLockBackoffMillis();
+        long leaseMillis = TimeUnit.SECONDS.toMillis(
+                Math.max(businessDynamicConfig.getProductDetailRebuildLockLeaseSeconds(), 1L));
+        long budgetMillis = Math.max(businessDynamicConfig.getProductDetailRebuildLockBudgetMillis(), 0L);
+        long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(budgetMillis);
 
-        for (int attempt = 0; attempt <= maxRetries; attempt++) {
-            // 1. 每轮先重新读缓存：leader 可能已重建完成
+        for (int attempt = 0; ; attempt++) {
+            // 1. 每轮先回读缓存：leader 可能已重建完成（也就是正常情况下的快路径）
             Object cached = tryReadCache(cacheKey);
             if (cached != null) {
-                if (isNullMarker(cached)) {
-                    throw new BusinessException(ErrorCode.PRODUCT_NOT_FOUND);
-                }
-                return (ProductVO) cached;
+                return unwrapCached(cached);
             }
 
-            // 2. 缓存仍 miss：tryLock(0) 立即尝试成为 leader（不阻塞等待，拿不到就退避重试）
-            boolean locked = false;
-            try {
-                locked = lock.tryLock(0, leaseSeconds, TimeUnit.SECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break; // 线程被中断，退出循环走最终降级
+            // 2. 预算已耗尽（或预算配 0 = 关闭等待）：不再等待，直接走降级
+            long remainingMillis = remainingMillis(deadlineNanos);
+            if (remainingMillis <= 0) {
+                break;
             }
 
+            // 3. 有限等待拿锁：片长 = min(剩余预算, 本轮退避)。
+            //    Redisson 会先做一次立即尝试，拿不到才订阅等待，
+            //    因此这一句同时覆盖了"抢锁"和"等待"两件事，不需要额外的 tryLock(0) 快路径。
+            long waitMillis = Math.min(remainingMillis, jitteredWaitMillis(attempt));
+            rebuildLockMetrics.recordWaitRound();
+            Boolean locked = tryLockQuietly(lock, waitMillis, leaseMillis);
+            if (locked == null) {
+                break; // 线程被中断：退出等待
+            }
             if (locked) {
-                try {
-                    // 3. 成为 leader：二次检查缓存（拿锁瞬间可能别的节点刚写完）
-                    Object cachedAgain = tryReadCache(cacheKey);
-                    if (cachedAgain != null) {
-                        if (isNullMarker(cachedAgain)) {
-                            throw new BusinessException(ErrorCode.PRODUCT_NOT_FOUND);
-                        }
-                        return (ProductVO) cachedAgain;
-                    }
-                    // 4. 真正回源重建
-                    return loadFromDbAndWriteCache(id, cacheKey);
-                } finally {
-                    if (lock.isHeldByCurrentThread()) {
-                        safeUnlock(lock, lockKey);
-                    }
-                }
+                rebuildLockMetrics.recordLeaderAcquired();
+                return rebuildAsLeader(id, cacheKey, lock, lockKey);
             }
-
-            // 5. 没拿到锁（leader 正在重建）：退避后重试读缓存，复用 leader 的结果
-            if (attempt < maxRetries) {
-                try {
-                    Thread.sleep(backoffMillis);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
-            }
+            // 4. 本轮没抢到锁：回到循环顶部回读缓存，复用 leader 的结果
         }
 
-        // 6. 重试耗尽（leader 迟迟未完成 / 锁异常）：降级直接查 DB 返回，避免请求无限阻塞
-        log.warn("singleflight 重建重试耗尽，降级直接查DB：productId={}", id);
-        return loadFromDbAndWriteCache(id, cacheKey);
+        // 走到这里 = 等待没换来结果（预算耗尽 / 线程被中断）→ 降级查 DB。
+        // 注意降级本身要过并发闸门，不能放任所有 follower 在同一瞬间一起打 DB
+        rebuildLockMetrics.recordBudgetExhausted();
+        log.warn("singleflight 重建等待预算耗尽，降级查DB：productId={}, budgetMillis={}", id, budgetMillis);
+        return degradeToDb(id, cacheKey);
+    }
+
+    /**
+     * 降级回源：绕过 singleflight 直接查 DB，但受并发闸门封顶。
+     *
+     * <p><b>为什么需要闸门：</b>预算耗尽说明 leader 已经卡了整整一个预算，
+     * 同一批 follower 会在相近时刻集体降级——这恰恰是 singleflight 想避免的场景，
+     * 却在"保护失效"的瞬间集中发生。若 leader 卡住的原因正是 DB 慢，
+     * 这些降级查询会让 DB 更慢，形成正反馈，最终连不相关的业务也被拖垮。
+     * 闸门把"同时查 DB"的请求数限制在连接池可承受的范围内。</p>
+     *
+     * <p><b>为什么超出就快速失败，而不是返回兜底数据：</b>商品详情里带价格和库存，
+     * 兜底值 = 空商品 / 错误价格，等于把"DB 压力"升级成"业务可用性事故"，
+     * 代价只是被转移到了更贵的一侧。快速失败虽然牺牲了这批请求，
+     * 但守住了数据正确性，也让线程尽快释放而不是堆积在连接池上。</p>
+     *
+     * <p>闸门上限为 0 时不封顶，退化成"降级不做任何限制"的旧行为（紧急开关）。</p>
+     */
+    private ProductVO degradeToDb(Long id, String cacheKey) {
+        int limit = businessDynamicConfig.getProductDetailRebuildLockDegradeMaxConcurrency();
+        if (!degradeLimiter.tryAcquire(limit)) {
+            rebuildLockMetrics.recordDegradeRejected();
+            log.warn("降级回源并发已达上限，快速失败：productId={}, limit={}, inFlight={}",
+                    id, limit, degradeLimiter.inFlight());
+            throw new BusinessException(ErrorCode.SYSTEM_BUSY);
+        }
+        try {
+            return loadFromDbAndWriteCache(id, cacheKey);
+        } finally {
+            degradeLimiter.release();
+        }
+    }
+
+    /**
+     * 以 leader 身份回源重建：拿锁后必须再查一次缓存，并在 finally 释放锁。
+     *
+     * <p>二次检查的必要性：从"开始尝试拿锁"到"真正拿到锁"之间可能已经过了一段时间
+     * （有限等待期间别的节点刚把缓存写好），此时应直接复用缓存，而不是重复回源。</p>
+     *
+     * <p>锁必须在写完缓存之后才释放，因此 {@code return} 表达式会先求值（查库 + 回写），
+     * 再执行 {@code finally} 的解锁——顺序不能颠倒，否则会放进第二个 leader。</p>
+     */
+    private ProductVO rebuildAsLeader(Long id, String cacheKey, RLock lock, String lockKey) {
+        try {
+            Object cachedAgain = tryReadCache(cacheKey);
+            if (cachedAgain != null) {
+                return unwrapCached(cachedAgain);
+            }
+            return loadFromDbAndWriteCache(id, cacheKey);
+        } finally {
+            if (lock.isHeldByCurrentThread()) {
+                safeUnlock(lock, lockKey);
+            } else {
+                // 回源还没结束锁就自动过期了（lease 偏短的直接证据）。
+                // 不是异常，但必须可见：此时可能有第二个 leader 并发回源，
+                // 表现为"DB 被同一个商品多查了几次"，不记录就永远查不出来。
+                log.warn("重建锁在回源期间已过期自动释放（lease 可能偏短）：lockKey={}", lockKey);
+                rebuildLockMetrics.recordLeaseLost();
+            }
+        }
+    }
+
+    /**
+     * 缓存值转 VO；命中"空值缓存"标记时抛商品不存在（防穿透语义）。
+     * 统一收口，避免同一段"判空标记 + 强转"逻辑在重建路径里重复三遍。
+     */
+    private ProductVO unwrapCached(Object cached) {
+        if (isNullMarker(cached)) {
+            throw new BusinessException(ErrorCode.PRODUCT_NOT_FOUND);
+        }
+        return (ProductVO) cached;
+    }
+
+    /**
+     * 尝试获取重建锁；返回 {@code null} 表示线程被中断，调用方应退出等待。
+     *
+     * <p>{@code waitMillis} 与 {@code leaseMillis} 必须同单位，故统一用毫秒：
+     * 预算和片长都是毫秒级，若用秒做单位，800ms 会被截断成 0、退化成"完全没有等待"。</p>
+     */
+    private Boolean tryLockQuietly(RLock lock, long waitMillis, long leaseMillis) {
+        try {
+            return lock.tryLock(waitMillis, leaseMillis, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return null;
+        }
+    }
+
+    /** 距截止时间还剩多少毫秒（已到期返回 0） */
+    private long remainingMillis(long deadlineNanos) {
+        long remainNanos = deadlineNanos - System.nanoTime();
+        return remainNanos <= 0 ? 0L : TimeUnit.NANOSECONDS.toMillis(remainNanos);
+    }
+
+    /**
+     * 单次等待片长：从 {@code backoffMillis} 起步、每轮翻倍，并叠加 ±50% 抖动。
+     *
+     * <p>抖动的作用：让同一批到达的等待者错峰重试，避免它们在退避结束时被同步唤醒、
+     * 一起降级查 DB 形成瞬时洪峰。</p>
+     *
+     * <p>指数增长的作用：leader 卡死（如 DB 严重抖动）时，若片长恒定不变，
+     * 一个 follower 会反复"订阅锁 + 退订"几十次，把 Redis 命令量放大数十倍；
+     * 翻倍后同一段预算内只需几次等待即可走完。前缀几轮仍然很短，保证正常情况反应快。</p>
+     *
+     * <p>位移次数上限 10（即最多放大 1024 倍）：防止配置被改成极大值时位移溢出。
+     * 下限 1ms：防止 {@code backoffMillis} 被配成 0 时片长为 0、退化成空转。</p>
+     */
+    private long jitteredWaitMillis(int attempt) {
+        long base = Math.max(businessDynamicConfig.getProductDetailRebuildLockBackoffMillis(), 1L);
+        long raw = base << Math.min(attempt, 10);
+        long half = raw / 2;
+        long jitter = ThreadLocalRandom.current().nextLong(raw - half + 1);
+        return Math.max(half + jitter, 1L);
     }
 
     /**
@@ -526,12 +661,17 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, ProductDO> im
 
     /**
      * 安全释放 Redisson 锁（防止锁已过期自动释放后再次 unlock 抛 IllegalMonitorStateException）
+     *
+     * <p>这里抛异常同样计入"租约丢失"指标：另一种租约已过期的表现形式
+     * （{@code isHeldByCurrentThread()} 与 {@code unlock()} 之间存在窗口，
+     * 判定时还在手里、解锁时已过期）。</p>
      */
     private void safeUnlock(RLock lock, String lockKey) {
         try {
             lock.unlock();
         } catch (IllegalMonitorStateException e) {
             log.warn("释放重建锁异常（可能已过期自动释放）：lockKey={}", lockKey, e);
+            rebuildLockMetrics.recordLeaseLost();
         }
     }
 
@@ -541,25 +681,33 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, ProductDO> im
      * <p>被 singleflight 的 leader（拿锁者）和极端降级路径共用：
      * DB 查不到（不存在 / 已逻辑删除）→ 写短 TTL 空值缓存（防穿透）后抛异常；
      * 查到 → 转 VO 并回写（带随机抖动的过期时间，防雪崩）后返回。</p>
+     *
+     * <p>整个方法的耗时（含"商品不存在"和抛异常这两条路径）都计入回源指标，
+     * 因为它们是判断"等待预算够不够、租约要不要调"的原始依据。</p>
      */
     private ProductVO loadFromDbAndWriteCache(Long id, String cacheKey) {
-        ProductDO productDO = this.getById(id);
-        if (productDO == null) {
-            // 缓存穿透防护：查不到也要写一份短 TTL 的空值缓存，挡住重复穿透
-            cacheNullResult(cacheKey, id);
-            throw new BusinessException(ErrorCode.PRODUCT_NOT_FOUND);
-        }
-        ProductVO vo = ProductConvert.INSTANCE.doToVO(productDO);
-
-        // 回写缓存（过期时间 = 基础 TTL + 随机抖动，防缓存雪崩）
-        long expireSeconds = resolveExpireWithJitter();
+        long startNanos = System.nanoTime();
         try {
-            redisTemplate.opsForValue().set(cacheKey, vo, expireSeconds, TimeUnit.SECONDS);
-            log.debug("回写商品详情缓存：productId={}, expire={}s", id, expireSeconds);
-        } catch (Exception e) {
-            log.warn("写入 Redis 缓存异常，不影响主流程：productId={}", id, e);
+            ProductDO productDO = this.getById(id);
+            if (productDO == null) {
+                // 缓存穿透防护：查不到也要写一份短 TTL 的空值缓存，挡住重复穿透
+                cacheNullResult(cacheKey, id);
+                throw new BusinessException(ErrorCode.PRODUCT_NOT_FOUND);
+            }
+            ProductVO vo = ProductConvert.INSTANCE.doToVO(productDO);
+
+            // 回写缓存（过期时间 = 基础 TTL + 随机抖动，防缓存雪崩）
+            long expireSeconds = resolveExpireWithJitter();
+            try {
+                redisTemplate.opsForValue().set(cacheKey, vo, expireSeconds, TimeUnit.SECONDS);
+                log.debug("回写商品详情缓存：productId={}, expire={}s", id, expireSeconds);
+            } catch (Exception e) {
+                log.warn("写入 Redis 缓存异常，不影响主流程：productId={}", id, e);
+            }
+            return vo;
+        } finally {
+            rebuildLockMetrics.recordDbLoad(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos));
         }
-        return vo;
     }
 
     // ==================== 缓存穿透 / 雪崩 防护 ====================

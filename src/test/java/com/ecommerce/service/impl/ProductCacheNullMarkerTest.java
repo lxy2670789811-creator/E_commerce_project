@@ -1,5 +1,6 @@
 package com.ecommerce.service.impl;
 
+import com.ecommerce.common.metrics.RebuildLockMetrics;
 import com.ecommerce.config.BusinessDynamicConfig;
 import com.ecommerce.mapper.ProductMapper;
 import com.ecommerce.vo.product.ProductVO;
@@ -112,7 +113,9 @@ class ProductCacheNullMarkerTest {
                 // 本用例只测详情缓存的 TTL，不触发版本号逻辑，mock 占位即可。
                 Mockito.mock(StringRedisTemplate.class),
                 config,
-                Mockito.mock(RedissonClient.class));
+                Mockito.mock(RedissonClient.class),
+                // 第 6 个依赖：singleflight 重建的运行指标。本用例不校验指标，mock 占位。
+                Mockito.mock(RebuildLockMetrics.class));
     }
 
     @Test

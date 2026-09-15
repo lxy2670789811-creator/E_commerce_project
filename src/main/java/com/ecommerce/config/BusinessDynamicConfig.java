@@ -36,9 +36,10 @@ import org.springframework.stereotype.Component;
      *     product-detail-expire-jitter-seconds: 300      # 过期时间随机抖动上限（秒，防雪崩）
      *     product-detail-null-cache-expire-seconds: 120  # 空值缓存过期（秒，防穿透）
      *     product-detail-rebuild-lock-enabled: true      # 缓存击穿防护开关（singleflight 互斥重建）
-     *     product-detail-rebuild-lock-lease-seconds: 10  # 重建锁自动释放超时（秒，防 leader 崩溃死锁）
-     *     product-detail-rebuild-lock-max-retries: 50     # 重建等待重试次数
-     *     product-detail-rebuild-lock-backoff-millis: 20 # 重建等待退避（毫秒）
+     *     product-detail-rebuild-lock-lease-seconds: 5   # 重建锁自动释放超时（秒，≈回源上限，非越大越好）
+     *     product-detail-rebuild-lock-budget-millis: 1000 # 重建等待总预算（毫秒，硬上限）
+     *     product-detail-rebuild-lock-backoff-millis: 20 # 重建等待起始片长（毫秒，每轮翻倍并带抖动）
+     *     product-detail-rebuild-lock-degrade-max-concurrency: 8 # 降级查DB的并发上限（0=不封顶）
      *     # --- 商品列表缓存（默认首页无筛选商品流） ---
      *     product-list-cache-enabled: true      # 列表缓存开关
      *     product-list-expire-seconds: 120       # 列表缓存过期（秒，短 TTL 兜底一致性）
@@ -173,23 +174,79 @@ public class BusinessDynamicConfig {
     /**
      * 重建锁持有超时（秒）—— 防止 leader 崩溃导致锁永不释放、该商品永远无法重建
      * Redisson 会在超过该时长后自动释放锁（死锁保护）
-     * 默认：10秒（远大于正常回源耗时，仅在 DB 严重抖动时兜底）
+     *
+     * <p><b>取值口径：约等于"回源超时上限"，而不是"越大越安全"。</b>
+     * 直觉上会想把租约调得很大以免中途丢锁，但方向是反的：
+     * leader 一旦卡死（如 DB 无响应），这个商品在本租约周期内<b>所有</b>请求
+     * 都拿不到锁、只能走降级查 DB——租约越长，"保护完全失效"的窗口越长。
+     * 所以要按"回源正常需要多久"来取，而不是按"最坏能有多久"。</p>
+     *
+     * <p>本项目口径：Hikari {@code connection-timeout=3000}（拿不到连接最多等 3 秒）
+     * + 查询与回写余量 → 回源上限约 3s，故租约取 <b>5 秒</b>，留 2 秒冗余。
+     * 两个联动约束：</p>
+     * <ul>
+     *   <li><b>租约 &gt; 等待预算</b>：否则等待者可能等到"锁已易主"，白等一轮；</li>
+     *   <li><b>租约 &gt; 回源上限</b>：否则锁在回源途中自动释放，会出现第二个 leader
+     *       （数据仍正确，但同一次 miss 被查两遍 DB）。是否发生由
+     *       {@code RebuildLockMetrics} 的 {@code leaseLost} 指标直接暴露。</li>
+     * </ul>
+     * <p>当前默认组合：等待预算 1s ＋ 回源上限 3s ＝ 4s &lt; 租约 5s，自洽。</p>
      */
-    private long productDetailRebuildLockLeaseSeconds = 10L;
+    private long productDetailRebuildLockLeaseSeconds = 5L;
 
     /**
-     * 重建锁等待重试次数（缓存击穿防护）
-     * 未拿到锁的并发请求会轮询缓存、退避重试，直到 leader 重建完成或重试耗尽
-     * 默认：50次（配合退避时间约 1 秒预算，覆盖绝大多数正常回源耗时）
+     * 重建等待总预算（毫秒）——缓存击穿防护，等待 leader 重建完成的时间硬上限
+     *
+     * <p>用"总时长预算"而不是"重试次数"：次数约束不了时间。
+     * 早期实现是 {@code maxRetries=50 × backoff=20ms}，看着是 1 秒，
+     * 但每轮还要发一次 Redis 读，真实耗时 = N×backoff + N×RTT，抖动时能到 2 秒。
+     * 现在由本预算算出绝对截止时间，每轮等待片长取"剩余预算"与"本轮退避"的较小值，
+     * <b>总耗时恒不超过本值</b>，与退避怎么调都无关。</p>
+     *
+     * <p>默认：1000 毫秒。设为 0 = 关闭等待（未抢到锁立即降级直查 DB），
+     * 可作紧急降级开关使用。</p>
+     *
+     * <p>取值需与 {@code ...-lease-seconds} 一起看：等待预算应显著小于租约时长，
+     * 否则等待者可能等到"锁已易主"；反过来租约也不宜过大，
+     * leader 卡死期间所有请求都会走降级查 DB，等于保护失效整整一个租约周期。</p>
      */
-    private int productDetailRebuildLockMaxRetries = 50;
+    private long productDetailRebuildLockBudgetMillis = 1000L;
 
     /**
-     * 重建锁等待退避时间（毫秒，缓存击穿防护）
-     * 未拿到锁的并发请求每次重试前的休眠时长（错峰，避免所有等待者同时重试）
-     * 默认：20毫秒
+     * 重建等待起始片长（毫秒，缓存击穿防护）——每次等待锁的时长
+     *
+     * <p>等待者用 {@code lock.tryLock(片长, lease)} 做有限等待，片长从本值起步<b>每轮翻倍</b>，
+     * 并叠加 ±50% 抖动。为什么不是固定值：</p>
+     * <ul>
+     *   <li><b>抖动</b>：让同一批到达的等待者错峰重试，避免它们在退避结束时被同步唤醒、
+     *       一起降级查 DB 形成瞬时洪峰。</li>
+     *   <li><b>翻倍</b>：leader 卡死时，片长恒定会让 follower 反复"订阅锁 + 退订"几十次，
+     *       把 Redis 命令量放大数十倍；翻倍后同一段预算内只需几次等待。</li>
+     * </ul>
+     *
+     * <p><b>不宜调大</b>：Redisson 的语义是"被唤醒但抢锁失败的一方仍要等满本次片长"，
+     * 片长太长会直接抬高正常请求的延迟（默认 20ms 与一次典型回源同量级）。
+     * 下限 1ms（配 0 也按 1ms 处理），避免退化成空转。</p>
      */
     private long productDetailRebuildLockBackoffMillis = 20L;
+
+    /**
+     * 降级回源的并发上限（缓存击穿防护）—— 同一瞬间允许有多少个请求绕过 singleflight 直接查 DB
+     *
+     * <p>等待预算耗尽后，同一批 follower 会在相近时刻集体降级查 DB。
+     * 这恰恰是 singleflight 想避免的场景，却在"保护失效"的瞬间集中发生；
+     * 若 leader 卡住的原因就是 DB 慢，这些查询会让 DB 更慢、形成正反馈。
+     * 本值把"同时查 DB"的请求数框在连接池可承受范围内。</p>
+     *
+     * <p><b>为什么超出后是"快速失败"而不是"返回兜底数据"：</b>商品详情带价格和库存，
+     * 兜底值 = 空商品 / 错误价格，等于把 DB 压力换成业务事故。快速失败牺牲这批请求，
+     * 但守住数据正确性、也守住系统存活。</p>
+     *
+     * <p><b>取值：</b>应显著小于数据库连接池上限（dev 10 / prod 15），给正常业务留连接。
+     * 默认 8 —— 留出余量的同时，也确保降级本身不至于瞬间占满池子。
+     * 设为 0 = 不封顶，退化成旧行为（降级不做限制），仅作紧急开关使用。</p>
+     */
+    private int productDetailRebuildLockDegradeMaxConcurrency = 8;
 
     // ====== 商品列表缓存（默认首页商品流） ======
     // 说明：仅对"无筛选"的默认首页商品流（keyword/category/status 均为空）做整页缓存。
