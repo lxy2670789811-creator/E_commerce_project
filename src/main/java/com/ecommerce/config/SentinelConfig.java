@@ -7,6 +7,7 @@ import com.alibaba.csp.sentinel.slots.block.degrade.DegradeRuleManager;
 import com.alibaba.csp.sentinel.slots.block.degrade.circuitbreaker.CircuitBreakerStrategy;
 import com.alibaba.csp.sentinel.slots.block.flow.FlowRule;
 import com.alibaba.csp.sentinel.slots.block.flow.FlowRuleManager;
+import com.ecommerce.feign.DeepSeekApiConstants;
 import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -25,10 +26,15 @@ import java.util.List;
  * 2. 本地初始化一套兜底的流控/熔断规则（控制台未配置时生效，控制台配置优先级更高）
  *
  * 资源命名约定：
- *  - "createOrder"：创建订单接口（QPS限流）
- *  - "cancelOrder"：取消订单接口（QPS限流，避免并发取消冲击）
- *  - "aiAfterSupportAnalyze"：AI售后分析接口（慢调用比例熔断降级）
- *  - "DeepSeekFeign#analyzeChat"：Feign调用大模型（异常比例熔断，底层保护）
+ *  - "createOrder"：创建订单接口（QPS限流）—— 与 @SentinelResource 的 value 同名
+ *  - "cancelOrder"：取消订单接口（QPS限流，避免并发取消冲击）—— 同上
+ *  - "aiAfterSupportAnalyze"：AI售后分析接口（慢调用比例熔断降级）—— 同上
+ *  - DeepSeekApiConstants.FEIGN_RESOURCE_NAME：Feign 调用大模型（异常比例熔断，底层保护）
+ *
+ * ⚠️ 前三个资源名由 @SentinelResource 直接指定，写法直白；
+ * 但 Feign 的资源名**由 SCA 框架生成、开发者指定的注解里根本没有它**，
+ * 形态是 "HTTP方法:url+path"（= POST:https://api.deepseek.com/v1/chat/completions），
+ * 不是 "类名#方法名"。写错就静默失效 —— 所以统一从常量类取，别手写。
  *
  * 所有阈值均从 BusinessDynamicConfig（Nacos 动态配置）读取，修改后可动态刷新。
  * 但注意：Sentinel 规则是"启动时加载"，运行期调整需走 Sentinel Dashboard。
@@ -104,7 +110,7 @@ public class SentinelConfig {
      *
      * 熔断层级说明（由外到内）：
      *   1. aiAfterSupportAnalyze 慢调用比例熔断 → 保护业务接口
-     *   2. DeepSeekFeign#analyzeChat 异常比例熔断 → 保护底层 AI 调用
+     *   2. Feign 调用（资源名 = POST:https://api.deepseek.com/v1/chat/completions）异常比例熔断 → 保护底层 AI 调用
      *
      * 两者形成"双层熔断"：上层接口慢调用多了就断，下层AI接口失败多了也断。
      */
@@ -125,8 +131,10 @@ public class SentinelConfig {
 
         // ============ 2. Feign调用DeepSeek大模型：异常比例熔断 ============
         // 这是更底层的熔断：当 AI 第三方接口大量失败/超时，直接熔断 Feign 调用
+        // ⚠️ 资源名必须与 SCA 的 SentinelInvocationHandler 生成的一致，否则规则永不命中；
+        //    别手写字符串，统一从 DeepSeekApiConstants 取（与 @FeignClient 的 url 同源）。
         DegradeRule deepSeekFeignRule = new DegradeRule();
-        deepSeekFeignRule.setResource("DeepSeekFeign#analyzeChat");
+        deepSeekFeignRule.setResource(DeepSeekApiConstants.FEIGN_RESOURCE_NAME);
         deepSeekFeignRule.setGrade(CircuitBreakerStrategy.ERROR_RATIO.getType());
         deepSeekFeignRule.setCount(businessDynamicConfig.getDeepseekErrorRatioThreshold());
         deepSeekFeignRule.setMinRequestAmount(5);
@@ -134,8 +142,10 @@ public class SentinelConfig {
         deepSeekFeignRule.setTimeWindow(60);
         rules.add(deepSeekFeignRule);
 
-        log.info("Sentinel 熔断规则：aiAfterSupportAnalyze(慢调用比例={}), DeepSeekFeign(异常比例={})",
-                aiAnalyzeRule.getSlowRatioThreshold(), deepSeekFeignRule.getCount());
+        log.info("Sentinel 熔断规则：aiAfterSupportAnalyze(慢调用比例={}), {} (异常比例={})",
+                aiAnalyzeRule.getSlowRatioThreshold(),
+                DeepSeekApiConstants.FEIGN_RESOURCE_NAME,
+                deepSeekFeignRule.getCount());
         DegradeRuleManager.loadRules(rules);
     }
 }

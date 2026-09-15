@@ -36,7 +36,7 @@ import java.time.format.DateTimeFormatter;
  * │    AI 接口大量超时时自动熔断，快速返回降级                  │
  * │ 3. Redis 滑动窗口限流（AiRateLimiter）：                   │
  * │    防止单用户频繁调用大模型                                 │
- * │ 4. Feign Sentinel 熔断（DeepSeekFeign#analyzeChat）：      │
+ * │ 4. Feign Sentinel 熔断（资源名见 DeepSeekApiConstants）：  │
  * │    AI API 异常比例过高时底层熔断                           │
  * │ 5. 业务降级兜底：                                          │
  * │    AI 调用失败 → 返回"待人工审核"，不影响接口整体可用       │

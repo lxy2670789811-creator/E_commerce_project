@@ -15,7 +15,7 @@
 | 用户 | **JWT 鉴权登录**：登录下发 Token，拦截器校验，`AuthContext`（ThreadLocal）传递身份，业务层取身份而非信任参数；收货地址管理（默认地址互斥） |
 | 订单 | **下单一次性凭证（幂等 Token）**：进入下单页 `GET /order/token` 领凭证、提交时 Lua 原子消耗（GETDEL），防双击/超时重试生成的重复订单与重复扣库存 |
 | AI 售后 | DeepSeek 大模型智能分析 + **五层保护**：动态开关 → Sentinel 熔断 → Redis 滑动窗口限流 → Feign 熔断 → 业务降级"待人工审核" |
-| 工程化 | 统一响应/全局异常、MapStruct、Knife4j 接口文档、Nacos 动态配置、多环境 profile、Docker Compose、**HikariCP 连接池护栏调优**、49 个测试（含并发防超卖集成测试） |
+| 工程化 | 统一响应/全局异常、MapStruct、Knife4j 接口文档、Nacos 动态配置、多环境 profile、Docker Compose、**HikariCP 连接池护栏调优**、57 个测试（含并发防超卖集成测试） |
 
 ## 技术栈
 
@@ -104,15 +104,16 @@ npm run dev   # http://localhost:5173
 mvn clean test
 ```
 
-共 **49 个测试**，重点：
+共 **57 个测试**，重点：
 
 - `OrderConcurrencyIntegrationTest`：真实 MySQL + Redis 并发防超卖（40 线程抢 20 库存 → 恰好 20 单、库存归 0、无超卖）
 - `OrderServiceImplTest`：下单/取消/支付回调/发货/完成/超时关单等 22 个核心路径
 - `OrderNoGeneratorTest`：订单号格式 + 5 万连续/并发唯一性
 - `DeepSeekClientTest`：AI 解析、重试、降级
+- `DeepSeekFeignResourceNameTest`：Feign 熔断资源名一致性——SCA 的 `SentinelInvocationHandler` 按 `HTTP方法:url+path` 生成资源名，**不是**「类名#方法名」；写成后者规则照常加载却永远不命中（熔断静默失效，而 fallback 降级照常工作，现象上看不出来）。本用例锁定 `@FeignClient` 与 Sentinel 规则共用同一常量，并断言实际注册的资源名
 - `AiRateLimiterTest`：限流放行/拒绝/Redis 故障降级
 - `ProductCacheNullMarkerTest`：缓存防护专项——空值标记序列化往返（防穿透能否生效的前提）、商品缓存类型还原不被误判、TTL 抖动区间与错峰效果、抖动开关
-- `ProductCacheSingleflightTest`：缓存击穿防护专项——singleflight 互斥重建的 leader 只回源一次、并发请求复用 leader 结果、二次查缓存命中不查 DB、开关关闭退化直查
+- `ProductCacheSingleflightTest`：缓存击穿防护专项——singleflight 互斥重建的 leader 只回源一次、并发请求复用 leader 结果、二次查缓存命中不查 DB、开关关闭退化直查、**总等待时长被预算硬约束（既等满、又不超）**、**降级并发闸门满载时快速失败且不触达 DB**（含"上限配 0 = 不封顶"的对照）、**租约丢失被计数且跳过 unlock**
 
 > 集成测试使用独立测试库 `ecommerce_test`（自动创建）与 Redis DB15，不污染开发数据；
 > 测试 profile 已禁用 Nacos/Sentinel/RocketMQ，无需额外中间件。
@@ -160,7 +161,7 @@ java -jar app.jar --spring.profiles.active=prod
 2. **缓存一致性 + 三防**：Cache-Aside + 写后删缓存（而非更新缓存），避免并发覆盖旧值；Redis 异常降级查库不影响主流程。
    - **防穿透**：DB 查不到（不存在 / 已逻辑删除）时写入短 TTL 空值标记（默认 120s），挡住同一个 productId 被反复打到数据库；
    - **防雪崩**：TTL = 基础值 + `random[0, 300s]` 随机抖动，让批量 key 错峰过期，避免同一时刻集体失效、请求同时回源；
-   - **防击穿（singleflight 互斥重建）**：热点 key 过期瞬间大量并发同时 miss 时，用 Redisson 分布式锁做 singleflight——同一 productId 同一时刻只允许一个线程回源（leader），其余线程轮询等待 leader 写完缓存后直接读缓存复用结果，不让并发同时打到数据库；开关、锁超时、等待重试次数与退避时间均支持 Nacos 热更新；
+   - **防击穿（singleflight 互斥重建）**：热点 key 过期瞬间大量并发同时 miss 时，用 Redisson 分布式锁做 singleflight——同一 productId 同一时刻只允许一个线程回源（leader），其余线程等锁并在 leader 写完缓存后直接读缓存复用结果，不让并发同时打到数据库；等待由**总时长预算**（默认 1000ms，绝对截止时间）硬约束，每次等待片长从 20ms 起步**每轮翻倍并叠加 ±50% 抖动**（抖动避免等待者被同步唤醒后一起降级查库，翻倍避免 leader 卡死时反复订阅锁放大 Redis 命令量）；预算耗尽则降级查 DB，**降级并发有闸门封顶**（默认 8，超出快速失败返回"系统繁忙"）——防止保护失效那一瞬把并发成倍放给 DB，详情含价格与库存故不返回兜底值；开关、锁租约（默认 5s，≈回源超时上限而非越大越好）、等待总预算、起始片长、降级并发上限均支持 Nacos 热更新；**运行指标**（预算耗尽数、降级拒绝数、租约丢失数、回源 avg/max 耗时）由 `RebuildLockMetrics` 累计，其中 `leaseLost` 是判断租约是否偏短的直接证据；
    - 开关均支持 Nacos 热更新，**置 false / 0 即关闭对应防护**（紧急降级开关）。
 3. **超时自动关单**：下单事务提交后**异步发送** RocketMQ 延迟消息（`asyncSend` + `SendCallback`，延迟级别可动态配置），请求线程入队即返回、不阻塞等待 broker 应答，因此同商品库存锁（释放挂在 `afterCompletion`，晚于 `afterCommit` 里的发送）的持有窗口被压缩，降低同款并发争用、提升吞吐、抗 broker 抖动；消费端幂等关单、回滚库存。可靠性由**三层兜底**保证：
    - **细粒度健康门控扫描**：`RocketMQ` 通道可用（模板已装配且最近发送成功）时直接跳过、零 DB 轮询；仅当 MQ 不可用时接管补偿。
