@@ -1,0 +1,46 @@
+# ==================== Kustomize 入口 ====================
+# 用 kustomize 而不是"一坨 kubectl apply -f ."的原因很实际：
+#   - 统一注入 namespace，省掉每个文件里重复写 metadata.namespace
+#   - 上一行写完 k8s 原生就有：kubectl kustomize / kubectl apply -k 都自带 kustomize，不需要额外装工具
+#   - 以后要加 dev/prod 环境差异时，只要加一个 overlays/ 目录，base 不用动
+#
+# 部署：
+#   kubectl apply -k deploy/k8s
+# 只看渲染结果（不连集群也能跑，用于本地校验）：
+#   kubectl kustomize deploy/k8s
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: ecommerce
+
+resources:
+  - namespace.yaml
+
+  # ---- 后端 ----
+  - configmap.yaml
+  - deployment.yaml
+  - service.yaml
+  - hpa.yaml
+  - pdb.yaml
+
+  # ---- 前端 ----
+  - frontend-deployment.yaml
+
+  # ---- 入口 ----
+  - ingress.yaml
+
+# 从 nginx 配置文件生成 ConfigMap。
+#   - files 路径相对于本文件所在目录，所以配置源必须放在 deploy/k8s/ 下
+#     （kustomize 默认禁止引用 kustomization 根目录之外的文件）
+#   - disableNameSuffixHash 保持默认(false)：名字里带内容 hash，改配置即改名，
+#     Deployment 引用随之变化 → kubectl apply -k 会自动触发一次滚动更新。
+#     这正是我们想要的：不需要任何人记得手动 rollout restart。
+configMapGenerator:
+  - name: ecommerce-frontend-nginx
+    files:
+      - frontend-nginx.conf
+
+# ⚠️ 刻意**不**把 secret.example.yaml 放进来。
+#    它是占位模板，直接 apply 会创建一个密码为 "REPLACE_ME" 的 Secret，
+#    Pod 能起来但连不上数据库，报错位置离真正原因很远（表现为认证失败而不是"你没配密码"）。
+#    正确顺序见 README.md：先手动创建 Secret，再 apply 这里的清单。

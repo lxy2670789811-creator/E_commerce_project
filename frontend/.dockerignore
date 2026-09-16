@@ -1,0 +1,19 @@
+# 构建上下文排除项。
+# frontend/node_modules 有 94MB+、七千多个小文件，一旦进入构建上下文：
+#   1. docker build 要把它整体打包发给 daemon，构建明显变慢
+#   2. COPY . . 会把宿主机的 node_modules 拷进镜像，覆盖掉镜像里 npm ci 装好的依赖，
+#      而两者可能架构不同（宿主机 Windows / 镜像 linux），运行时报莫名其妙的模块错误
+node_modules
+dist
+.vite
+
+# 日志与本地配置
+npm-debug.log*
+yarn-error.log*
+*.local
+
+# 编辑器 / 系统
+.idea
+.vscode
+.DS_Store
+Thumbs.db

@@ -1,0 +1,49 @@
+# ==================== 后端非敏感配置 ====================
+# 键名必须与 application-prod.yml / bootstrap.yml 里的 ${...} 占位符**逐字一致**，
+# 拼错不会报"变量名错"，只会走代码里的默认值 —— 表现为"改了这个 ConfigMap 没生效"。
+# 对应关系（prod profile）：
+#   MYSQL_URL / REDIS_HOST / REDIS_PORT / REDIS_DATABASE / ROCKETMQ_NAME_SERVER
+#   SENTINEL_DASHBOARD / JWT_SECRET(在 Secret) / DEEPSEEK_API_KEY(在 Secret)
+#   MYSQL_USERNAME / MYSQL_PASSWORD（在 Secret）
+#
+# ⚠️ 地址一律写内网域名 / 云托管连接串，不要写宿主机 IP：
+#    容器里的 127.0.0.1 是 Pod 自己，写 localhost 会把"连不上数据库"变成
+#    一次毫无头绪的排查（这也是 docker-compose 迁到 K8s 最常见的翻车点）。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ecommerce-backend-config
+  namespace: ecommerce
+  labels:
+    app.kubernetes.io/name: ecommerce-backend
+    app.kubernetes.io/component: backend
+data:
+  # --- MySQL ---
+  # useSSL=true + allowPublicKeyRetrieval 视云厂商要求调整；云托管一般要求 SSL。
+  MYSQL_URL: "jdbc:mysql://mysql.ecommerce.svc.cluster.local:3306/ecommerce?useUnicode=true&characterEncoding=utf-8&useSSL=true&serverTimezone=Asia/Shanghai"
+
+  # --- Redis ---
+  REDIS_HOST: "redis.ecommerce.svc.cluster.local"
+  REDIS_PORT: "6379"
+  REDIS_DATABASE: "0"
+
+  # --- RocketMQ ---
+  ROCKETMQ_NAME_SERVER: "rocketmq-namesrv.ecommerce.svc.cluster.local:9876"
+
+  # --- Sentinel Dashboard ---
+  # 只影响规则可视化，连不上不影响业务（规则在应用启动时由 SentinelConfig 注册）。
+  # ⚠️ 但要知道：规则在**每个副本的内存里各存一份**，Dashboard 推送也只到建立心跳的实例。
+  #    表现是"熔断时灵时不灵"—— 某个副本熔断了，流量切到没熔断的副本继续打。
+  #    正式做法是接 datasource 做规则持久化（Nacos 数据源），本项目暂未做。
+  SENTINEL_DASHBOARD: "sentinel-dashboard.ecommerce.svc.cluster.local:8858"
+
+  # --- Nacos 配置中心 ---
+  # 对应 bootstrap.yml 里的 ${NACOS_SERVER_ADDR:127.0.0.1:8848} 与 ${NACOS_NAMESPACE:public}
+  # （已在配置分离改造中改成环境变量占位）。
+  # ⚠️ 若哪天有人把 bootstrap.yml 改回写死 IP，这两个键会**静默失效**：
+  #    Nacos 连不上不会导致启动失败，只会让热更新参数全部回落到代码默认值。
+  NACOS_SERVER_ADDR: "nacos.ecommerce.svc.cluster.local:8848"
+  NACOS_NAMESPACE: "ecommerce-prod"
+
+  # --- 业务动态参数（也可继续放 Nacos 热更新，二者不冲突）---
+  # 这里只放"部署维度"的参数；能热更新的一律优先走 Nacos，改完不用重启。

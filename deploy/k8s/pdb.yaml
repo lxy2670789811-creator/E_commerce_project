@@ -1,0 +1,25 @@
+# ==================== PodDisruptionBudget ====================
+# 先明确 PDB 管什么、不管什么，这是最容易被高估的一个对象：
+#
+#   ✅ 管：**自愿中断** —— 节点排水（kubectl drain / 集群升级 / 自动缩容节点）。
+#          有 PDB 时，驱逐操作会等到"可用副本数 ≥ minAvailable"才继续，不会一次性赶走全部副本。
+#   ❌ 不管：滚动更新（由 Deployment 的 strategy 控制，见 deployment.yaml）、
+#          节点宕机 / OOMKill（非自愿中断，K8s 无法阻止）、HPA 缩容。
+#
+# 也就是说，deployment.yaml 里 maxUnavailable: 0 已经保证了发版不丢容量，
+# 这个 PDB 是给"运维动节点"兜底的 —— 少了它，集群管理员一条 drain 就可能把两个副本同时赶走。
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ecommerce-backend
+  namespace: ecommerce
+  labels:
+    app.kubernetes.io/name: ecommerce-backend
+spec:
+  # minAvailable: 1 而不是 2（全部保留）：
+  # 要求全部副本始终可用会让 drain 永远卡住（无法驱逐任何 Pod），
+  # 节点维护做不下去。留 1 个可用是"降级但可用"与"能维护"之间的平衡点。
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ecommerce-backend

@@ -1,0 +1,134 @@
+# ==================== 前端 Deployment ====================
+# 与前端的差异点集中在三处，都写在下面了：
+#   1. 容器内监听 8080 而不是 80（非 root 不能绑特权端口）
+#   2. 用 nginx-unprivileged 镜像而不是 nginx
+#   3. preStop 只要 3s（后端要 8s，因为要等在途事务）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ecommerce-frontend
+  namespace: ecommerce
+  labels:
+    app.kubernetes.io/name: ecommerce-frontend
+    app.kubernetes.io/component: frontend
+    app.kubernetes.io/part-of: ecommerce-platform
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  # 前端是静态文件，没有 JIT 预热问题，minReadySeconds 可以给 0（默认）。
+  # 这里给 5s 只是为了让滚动更新的节奏稳定一些。
+  minReadySeconds: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ecommerce-frontend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ecommerce-frontend
+        app.kubernetes.io/component: frontend
+    spec:
+      # 静态文件服务，停机时没有"在途事务"，30s 足够。
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        # nginx-unprivileged 镜像内置的用户就是 uid 101（nginx）。
+        # 用 101 而不是自定义 uid，是为了能用上镜像里已经调好的目录属主。
+        runAsUser: 101
+        runAsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: frontend
+          # ⚠️ 为什么不是 nginx:alpine：
+          #   官方 nginx 镜像默认以 root 启动 master 进程，因为要绑 80 端口（特权端口）、
+          #   并且要把 pid 写到 /var/run、缓存写到 /var/cache/nginx。
+          #   在 runAsNonRoot 下这些都会失败（Permission denied / 无法绑定 80）。
+          #   nginx-unprivileged 是官方出的非 root 变体：监听 8080、pid 与临时目录都改到 /tmp，
+          #   开箱即可跑在 "非 root + 只读根文件系统" 的约束下，不需要任何 hack。
+          image: registry.example.com/ecommerce/frontend:0.1.0
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          env:
+            - name: TZ
+              value: "Asia/Shanghai"
+
+          # ---------- 探针 ----------
+          # 前端没有下游依赖，"能返回 200"就等于健康，不需要区分 startup/readiness/liveness。
+          # 用 httpGet 而不是 exec+kubectl/nginx -t：
+          #   exec 探针会在容器里 fork 进程，静态站这种高频探测场景下是可观的额外开销。
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              # nginx 是事件驱动 + 静态文件，内存占用很小。
+              # 同样不给 cpu limit —— 突发流量下被节流会让响应时间抖动。
+              memory: 128Mi
+
+          lifecycle:
+            preStop:
+              exec:
+                # 与后端同一个道理（摘 Endpoint 与发 SIGTERM 并行），
+                # 但 nginx 处理一个静态请求是毫秒级，不需要 8s 那么长的窗口。
+                command: ["sh", "-c", "sleep 3"]
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            # 这里**没有**开 readOnlyRootFilesystem（后端开了）。
+            # 原因：nginx 还要写 /var/cache/nginx 下的 client_body_temp 等临时目录，
+            # nginx-unprivileged 把其中一部分改到了 /tmp，但没有全部覆盖。
+            # 要开启需要先把所有 temp path 显式指到 /tmp —— 收益（防篡改）有限，
+            # 而风险（启动即崩）不小，所以按不开启处理；配置这里已注明做法备查。
+
+          volumeMounts:
+            # 整目录挂载而不是 subPath 挂单个文件：
+            #   - 目录挂载会覆盖镜像里自带的 /etc/nginx/conf.d（含默认的 default.conf），
+            #     于是"容器里实际生效的配置"就只有我们这一份，不存在两份配置谁赢的问题。
+            #   - subPath 挂载的文件不会有后续更新，目录挂载的内容在 ConfigMap 变化后
+            #     会同步到容器（虽然 nginx 要 reload 才读取，但配合下面的 hash 机制，
+            #     改配置本身就一定会触发一次 Pod 重建，所以这个差异在实践中不构成问题）。
+            - name: nginx-conf
+              mountPath: /etc/nginx/conf.d
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: nginx-conf
+          configMap:
+            # 这里写的名字**不带** hash 后缀，但 `kubectl kustomize` 渲染时会被自动改成
+            # ecommerce-frontend-nginx-<内容hash>，并同步改写本行引用。
+            # 所以：不要手写带 hash 的名字（每次改配置都要改），也不要给这个 ConfigMap
+            # 再加一份手写定义（会生成两个同名不同 hash 的对象）。
+            name: ecommerce-frontend-nginx
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi

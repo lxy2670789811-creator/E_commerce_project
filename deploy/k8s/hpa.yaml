@@ -1,0 +1,69 @@
+# ==================== HPA（水平自动扩缩） ====================
+# 前置条件（缺一个 HPA 就不工作，且报错信息都不算直观）：
+#   1. 集群里装了 metrics-server —— 否则 `kubectl get hpa` 的 TARGETS 一直显示 <unknown>，
+#      事件里报 "failed to get cpu utilization: unable to get metrics"。
+#   2. Deployment 里**必须**设了 requests.cpu —— 利用率的计算基准是 requests 而不是 limit。
+#      没设 requests 时 HPA 直接拒绝工作（报 missing request for cpu），
+#      这也是为什么 deployment.yaml 里给 requests.cpu 有具体值而不是省略。
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ecommerce-backend
+  namespace: ecommerce
+  labels:
+    app.kubernetes.io/name: ecommerce-backend
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ecommerce-backend
+  # minReplicas=2：单副本意味着任何一次滚动更新、任何一次节点故障都是服务中断。
+  # 同时它也是 L0 定时任务选主能起作用的前提 —— 只有一个副本时"选主"无从谈起。
+  minReplicas: 2
+  # maxReplicas=6 不是随手写的，是被**数据库连接数**卡住的：
+  #   Hikari maximum-pool-size=15 是**每个实例**的池（这点最容易算错），
+  #   6 副本 = 90 条连接，叠加滚动更新瞬间多出的 1 个 Pod ≈ 105 条，
+  #   而 MySQL 默认 max_connections=151，还要留给运维工具和其它应用。
+  #   前端 nginx 与 Sentinel Dashboard 也会占连接/句柄，所以 6 是留了余量的上限。
+  #   → 扩容前先算这笔账，否则第二次扩容就会开始报 "Too many connections"。
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    # 刻意不加 memory 指标：
+    #   内存利用率作为扩容信号对 Java 应用基本无效 —— JVM 堆只涨不还（G1/CMS 都不主动归还给 OS），
+    #   稳态占用会长期贴近 limit，HPA 会一直以为"内存紧张"而扩到天花板再也不缩回来。
+    #   内存该做的是设 limit + 告警，不是扩容。
+  behavior:
+    # 扩容快：CPU 冲上来就是要立刻加副本，等就来不及了。
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100          # 一次翻倍
+          periodSeconds: 30
+        - type: Pods
+          value: 2            # 或一次加 2 个，取两者中更大的
+          periodSeconds: 30
+      selectPolicy: Max
+    # 缩容慢：给 5 分钟观察窗，避免"流量尖峰 → 扩容 → 尖峰过去 → 立刻缩容 → 又来尖峰"的抖动。
+    # 抖动比慢一点缩容更伤 —— 每次扩缩容都要经历 JVM 冷启动 + JIT 预热。
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+      selectPolicy: Max
+  # ---------- 一个必须说清的预期边界 ----------
+  # HPA 扩的是**应用副本**，不是数据库吞吐。本项目的下单链路瓶颈在 MySQL 行锁 + Redisson
+  # 分布式锁（createOrder 天然串行化），加 Pod 不会让下单变快，只会让更多线程一起抢锁
+  # —— 从压测数据看，下单接口的 QPS 天花板由锁和 DB 往返次数决定，与副本数无关。
+  #
+  # 所以：HPA 的实际收益在**商品查询 / AI 售后**这类无锁的读链路。
+  # 把下单瓶颈归因到"副本不够"是常见的误判；真正的解法是减少锁内非临界区操作
+  # （见性能基线里的 P1：一次下单 8 次 DB 往返、商品被读两遍）。

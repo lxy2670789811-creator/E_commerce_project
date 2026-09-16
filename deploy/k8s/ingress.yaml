@@ -1,0 +1,82 @@
+# ==================== Ingress ====================
+# 路由职责只有两条：
+#   /api/*  → 后端 Service（8080）
+#   其余     → 前端 nginx（80，容器内 8080）
+#
+# 前缀匹配规则：Ingress 按**最长前缀**优先，所以 /api/actuator 这条比 /api 更精确的规则会先命中。
+# 注意 Kubernetes 的 Prefix 是按路径段匹配的：/api 能匹配 /api 和 /api/orders，
+# 但**不会**匹配 /apifoo，所以不需要担心前缀误伤。
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ecommerce
+  namespace: ecommerce
+  labels:
+    app.kubernetes.io/part-of: ecommerce-platform
+  annotations:
+    # ---------- 屏蔽管理端点（这是 L0「管理端口不分离」决策的代价，在这里补上）----------
+    # L0 时决定让 /actuator 与业务共用 8080（理由：单体内部系统、Knife4j 本来就在 8080、
+    # health 不返回细节）。代价就是同端口意味着 Ingress 的 /api 前缀会把它一起带出去，
+    # 所以必须在入口层显式挡掉。
+    #
+    # ⚠️ 前提：ingress-nginx 从 v1.9.0 起默认把 snippet 类注解**关掉了**（安全修复，
+    #    防止能改 Ingress 的人注入任意 nginx 配置）。若注解不生效，需要 controller 侧
+    #    开启：ConfigMap 里设 allow-snippet-annotations: "true"，或给注解加前缀白名单。
+    #    找不到人开权限时的替代方案（不依赖任何注解，用最长前缀引流到前端做黑洞）：
+    #      - path: /api/actuator
+    #        pathType: Prefix
+    #        backend:
+    #          service:
+    #            name: ecommerce-frontend
+    #            port: { number: 80 }
+    #    前端 nginx 里已配了 `location ^~ /api/actuator { return 404; }`，所以这条会稳定返回 404，
+    #    而不是落到 SPA fallback 上返回一个 200 + HTML（那等于告诉扫描器"这里有个端点"）。
+    nginx.ingress.kubernetes.io/server-snippet: |
+      location /api/actuator {
+        deny all;
+        return 403;
+      }
+
+    # ---------- 超时与体积 ----------
+    # 后端 AI 售后接口的 Feign readTimeout 是 30s，入口超时必须比它大，
+    # 否则用户看到的是 Ingress 的 504，而后端其实还在正常处理 —— 排查时会被误导。
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "5"
+    # 本项目没有文件上传接口，收紧请求体上限可以把大包攻击面直接砍掉。
+    nginx.ingress.kubernetes.io/proxy-body-size: "2m"
+
+    # 强制 HTTPS（证书就绪后启用；未启用时集群里必须先关掉这条，否则会重定向到不存在的证书）
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  # 显式指定 IngressClass，不依赖集群的默认 class，避免被别的 controller 接管。
+  ingressClassName: nginx
+  tls:
+    # 证书建议由 cert-manager 用 Let's Encrypt 自动签发/续期，它会把结果写进这个 Secret。
+    # 不要手工把证书文件提交到仓库。
+    - hosts:
+        - shop.example.com
+      secretName: ecommerce-tls
+  rules:
+    - host: shop.example.com
+      http:
+        paths:
+          # 后端：保留 /api 前缀原样转发。
+          # 因为后端 context-path 本身就是 /api，Ingress 这里**不需要**任何 rewrite ——
+          # 加 rewrite 去掉前缀反而会 404（这是从"前端 nginx 反代"迁过来时最容易搞反的一处）。
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: ecommerce-backend
+                port:
+                  name: http
+
+          # 前端：静态资源 + SPA 路由兜底
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ecommerce-frontend
+                port:
+                  name: http

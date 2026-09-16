@@ -1,0 +1,11 @@
+# ==================== 命名空间 ====================
+# 单独开 ns 而不是塞进 default，有三个实际好处：
+#   1. ResourceQuota / LimitRange 可以按 ns 施加（防止某个应用把节点吃空）
+#   2. RBAC 按 ns 授权，CI 的部署账号只能动这个 ns
+#   3. `kubectl get all -n ecommerce` 就是完整应用视图，不用靠 label 过滤
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ecommerce
+  labels:
+    app.kubernetes.io/part-of: ecommerce-platform

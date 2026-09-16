@@ -6,9 +6,15 @@ spring:
       # ========== Nacos 配置中心 ==========
       config:
         # Nacos Server 地址
-        server-addr: 127.0.0.1:8848
-        # 命名空间（默认 public，可按环境隔离：dev/test/prod）
-        namespace: public
+        # ⚠️ 必须走环境变量。写死 127.0.0.1 在容器里指向 Pod 自身，
+        #    而 Nacos 客户端连不上配置中心**不会**让应用启动失败（非 fail-fast），
+        #    表现是"服务正常起来了，但所有 Nacos 热更新参数都在悄悄用代码默认值"——
+        #    这属于最难发现的一类配置问题。默认值保留本地开发/docker-compose 可用。
+        server-addr: ${NACOS_SERVER_ADDR:127.0.0.1:8848}
+        # 命名空间（public / 按环境隔离：dev / test / prod）
+        # 生产用独立 namespace，避免测试配置与线上配置互相污染；
+        # 对应 K8s 清单里的 NACOS_NAMESPACE（见 deploy/k8s/configmap.yaml）。
+        namespace: ${NACOS_NAMESPACE:public}
         # 配置分组
         group: ECOMMERCE_GROUP
         # 配置文件格式：yaml

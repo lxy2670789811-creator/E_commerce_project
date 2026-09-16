@@ -17,6 +17,8 @@ work/
 .env
 .env.local
 .env.*.local
+# K8s Secret：从 deploy/k8s/secret.example.yaml 复制而来，填真实密码，绝不入库
+deploy/k8s/secret.yaml
 
 # ===== Logs =====
 logs/

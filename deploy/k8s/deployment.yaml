@@ -1,0 +1,206 @@
+# ==================== 后端 Deployment ====================
+# 本文件承载三件事，也是面试最容易被追问的三处：
+#   1. 探针（startup / readiness / liveness 三者分工）—— 见 containers[].startupProbe 附近注释
+#   2. 滚动更新不丢请求（strategy + minReadySeconds + preStop + gracePeriod 四件套）
+#   3. 资源 requests/limits 与 JVM 堆的联动（MaxRAMPercentage=70 依赖 limits.memory）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ecommerce-backend
+  namespace: ecommerce
+  labels:
+    app.kubernetes.io/name: ecommerce-backend
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: ecommerce-platform
+spec:
+  # ⚠️ 这里写 2 是为了与 HPA 的 minReplicas 保持一致，不是为了"手动管副本数"。
+  #    坑：如果这里写 3 而 HPA minReplicas=2，每次 `kubectl apply` 都会把副本数拉回 3，
+  #    表现为"扩缩容后一 apply 就弹回去"。要么与 minReplicas 对齐，要么删掉此行交给 HPA。
+  replicas: 2
+  revisionHistoryLimit: 3          # 只留 3 个历史 ReplicaSet，否则 ReplicaSet 会越积越多
+  progressDeadlineSeconds: 300     # 5 分钟内没完成滚动更新就标记为失败（与 startupProbe 的 120s 上限呼应）
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # maxUnavailable=0：先把新副本拉起来、就绪之后才删旧的 —— 滚动期间容量不下降。
+      # 代价是需要额外 1 个 Pod 的资源余量，集群资源紧张时新 Pod 会 Pending。
+      # 若集群资源吃紧，改成 maxSurge:0 / maxUnavailable:1（用可用性换资源）。
+      maxUnavailable: 0
+      maxSurge: 1
+  # 新 Pod 通过 readiness 后再等 15s 才计入"可用"。
+  # 原因：Java 应用 ready 那一刻只是"能响应探测请求"，JIT 还在解释执行，
+  # 立刻把全部流量切过来会出现一段明显的延迟尖峰。给 15s 让热点方法完成编译。
+  minReadySeconds: 15
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ecommerce-backend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ecommerce-backend
+        app.kubernetes.io/component: backend
+    spec:
+      # ============================================================
+      # 优雅停机相关（与 L0 的 application.yml 是配套的一对，缺一不可）
+      # ============================================================
+      # 必须 > spring.lifecycle.timeout-per-shutdown-phase(30s)，留 15s 收尾余量。
+      # 否则 Tomcat 还在处理在途请求时进程就被 SIGKILL，"优雅"变成"硬切"。
+      terminationGracePeriodSeconds: 45
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001            # 与 Dockerfile 里 useradd -u 10001 一致
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault      # 限制容器可用的系统调用集合
+
+      # 拉私有仓库镜像时启用（仓库凭据不要明文写，用 kubectl create secret docker-registry 生成）
+      # imagePullSecrets:
+      #   - name: registry-credential
+
+      # 尽量把副本打散到不同节点：单节点故障时不会一次掉两个副本。
+      # whenUnsatisfiable 选 ScheduleAnyway 而不是 DoNotSchedule ——
+      # 单节点集群（如本地 kind / minikube）下 DoNotSchedule 会让第二个副本永远 Pending。
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: ecommerce-backend
+
+      containers:
+        - name: backend
+          # ⚠️ 生产禁止用 latest：latest + imagePullPolicy:Always 无法回滚到确定版本，
+          #    而且两个不同 Pod 可能拉到不同代码。推荐用 git sha 或语义化版本。
+          #    本地 kind/minikube 调试可临时改成 ecommerce-order-backend:0.1.0 + IfNotPresent。
+          image: registry.example.com/ecommerce/order-backend:0.1.0
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            # 给端口起名，Service 用 targetPort: http 引用 —— 以后改端口号只改这一处。
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          env:
+            # profile 是"部署契约"，刻意放在 Deployment 而不是 ConfigMap：
+            # 改它应当触发一次滚动更新（新 Pod 才生效），而不是改完 ConfigMap
+            # 下次 Pod 重建时才悄悄换掉环境。
+            - name: SPRING_PROFILES_ACTIVE
+              value: "prod"
+            # 时区：基础镜像默认 UTC，不设的话日志时间戳比本地少 8 小时，
+            # 与 MySQL serverTimezone=Asia/Shanghai 的记录对不上，排查时间线会很难受。
+            - name: TZ
+              value: "Asia/Shanghai"
+            # 用 JAVA_TOOL_OPTIONS 注入 JVM 参数，是因为 Dockerfile 的 ENTRYPOINT 是 exec 数组形式
+            # （exec 形式换来了 PID 1 直接是 java 进程、SIGTERM 能正确传给 JVM）。
+            # 代价就是没法从外部追加参数，JAVA_TOOL_OPTIONS 是 JVM 自己会读的补救口子。
+            # OOM 时把堆 dump 到 /tmp（已挂 emptyDir），Pod 没被删除前可以捞出来分析。
+            # 注意：JVM 会在 stdout 打一行 "Picked up JAVA_TOOL_OPTIONS"，属正常现象。
+            - name: JAVA_TOOL_OPTIONS
+              value: "-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/tmp"
+          envFrom:
+            # 非敏感配置：改 ConfigMap 不会自动重启 Pod，需 `kubectl rollout restart`
+            - configMapRef:
+                name: ecommerce-backend-config
+            # 敏感配置：必须已存在，否则 Pod 卡在 CreateContainerConfigError
+            - secretRef:
+                name: ecommerce-backend-secret
+
+          # ---------- 资源 ----------
+          # limits.memory 必须设：Dockerfile 里 -XX:MaxRAMPercentage=70.0 靠它算堆大小。
+          # 2Gi limit → 堆约 1.4Gi，剩下 0.6Gi 留给元空间、线程栈、直接内存、Netty 堆外缓存。
+          # 若把 limit 降到 1Gi，堆只剩 700Mi，本项目 100 并发下单压测就会出现 GC 抖动。
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              # ⚠️ 刻意不给 cpu limit：
+              #   CPU 是可压缩资源，设了 limit 会触发 cgroup throttling，
+              #   而 JVM 的 GC 线程和 JIT 编译线程需要突发多核，
+              #   被限流的表现就是 p99 延迟周期性尖刺（且 CPU 使用率看着并不高，很难查）。
+              #   风险是极端情况下单个 Pod 抢节点 CPU，靠 requests + 节点隔离控制即可。
+              memory: 2Gi
+
+          # ============================================================
+          # 探针三件套
+          # ============================================================
+          # startupProbe：只负责"给启动留时间"，成功前会**屏蔽** liveness/readiness。
+          # 有了它，liveness 才能用激进参数（10s×3）而不用担心启动慢被误杀 ——
+          # 这是替代"把 initialDelaySeconds 拍个 120s"的正确做法（后者会拖慢故障发现）。
+          # 端点选 readiness 而不是 liveness：等应用真正 ready（ApplicationReadyEvent）才算启动完成。
+          startupProbe:
+            httpGet:
+              path: /api/actuator/health/readiness   # 注意 context-path=/api，漏了会 404
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 24                     # 最多容忍 120s 启动
+          # readinessProbe：失败只从 Service 摘流量，**不重启**。
+          # 所以中间件健康度放进这里是安全的（不会触发重启）—— 但"安全"不等于"该放"：
+          # 本项目刻意**没有**把 db/redis 放进 readiness，理由见 application.yml 里
+          # group.readiness 的注释（核心是：依赖抖动不该让所有 Pod 同时退出流量）。
+          readinessProbe:
+            httpGet:
+              path: /api/actuator/health/readiness
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3                      # 连续 3 次失败摘流量（15s）
+            successThreshold: 1
+          # livenessProbe：失败会**重启容器**，所以只查应用自身存活。
+          # ⚠️ 绝不能把 DB/Redis 连通性放进 liveness：中间件抖一下，
+          #    K8s 会把所有副本全部重启，把"暂时不可用"放大成"全站崩溃"。
+          #
+          # ⚠️ 而"默认分组会自动帮你做对这件事"是**错的**（2026-09-16 实测）：
+          #    打开 probes 之后，liveness 与 readiness 两组默认**都包含全部健康指示器**
+          #    （db / redis / nacosConfig / sentinel / diskSpace），实测列出的组件完全相同。
+          #    也就是说：application.yml 里若不显式写
+          #      management.endpoint.health.group.liveness.include: livenessState
+          #    那么下面这个探针实际探测的是数据库 —— 正是上面警告的那个场景。
+          #    本项目已在 application.yml 里显式收敛两个分组的 include，改动前请先看那段注释。
+          livenessProbe:
+            httpGet:
+              path: /api/actuator/health/liveness
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3                      # 30s 内三次失败才重启，避开单次抖动
+
+          # ---------- 停机钩子 ----------
+          lifecycle:
+            preStop:
+              exec:
+                # 为什么是 sleep 而不是"优雅退出"：
+                # K8s 在删除 Pod 时，是**并行**做两件事 —— 发 SIGTERM、把 Pod 从 Endpoint 摘除。
+                # 于是存在一个竞态窗口：SIGTERM 已发出（进程开始准备关闭），
+                # 但 kube-proxy 还没更新转发规则，新请求仍会被打到这个正在停机的 Pod 上。
+                # sleep 8s 让 Windows 期被吸收掉，之后再让应用走优雅停机流程。
+                # （另一条路是调 kube-apiserver 的 --endpoint-updates-before-... 类参数，
+                #   但 sleep 是最省事、最通用的做法。）
+                command: ["sh", "-c", "sleep 8"]
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            # 根文件系统只读，唯一可写目录是挂进来的 /tmp。
+            # 与 Dockerfile 里的 -Djava.io.tmpdir=/tmp 是配套的：Tomcat 的工作目录
+            # 默认建在 java.io.tmpdir 下，指向 /tmp 才能既只读又正常启动。
+            # ⚠️ 本项目未在真实集群实测过这一项：若 Pod 反复 CrashLoopBackOff 且日志提到
+            #    "Read-only file system"，先注掉本行定位是哪个客户端在写盘（本机无此报错）。
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        # 只在 Pod 生命周期内存在：HeapDump、Tomcat 工作目录都落在这里。
+        # 设 sizeLimit 防止写满节点磁盘（emptyDir 默认能用光节点所有磁盘空间）。
+        - name: tmp
+          emptyDir:
+            sizeLimit: 512Mi

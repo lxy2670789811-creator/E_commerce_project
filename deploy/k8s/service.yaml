@@ -1,0 +1,46 @@
+# ==================== Service ====================
+# 两个 Service 都是 ClusterIP：只做集群内发现，外部流量统一由 Ingress 进来。
+# 刻意**不**用 NodePort —— 那样每个节点都会开一个高位端口，等于绕过了 Ingress 上
+# 的限流、TLS、鉴权，还要求外部能直连节点 IP。
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ecommerce-backend
+  namespace: ecommerce
+  labels:
+    app.kubernetes.io/name: ecommerce-backend
+    app.kubernetes.io/component: backend
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ecommerce-backend
+  ports:
+    - name: http
+      port: 8080
+      # 用命名端口而不是写 8080：以后容器改端口只改 Deployment 里的 name 映射。
+      targetPort: http
+      protocol: TCP
+  # 应用是无状态的（JWT 无 Session、锁与限流都在 Redis），不需要会话保持。
+  # 设成 ClientIP 会把流量钉在单个副本上，HPA 扩出来的副本分不到请求。
+  sessionAffinity: None
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ecommerce-frontend
+  namespace: ecommerce
+  labels:
+    app.kubernetes.io/name: ecommerce-frontend
+    app.kubernetes.io/component: frontend
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ecommerce-frontend
+  ports:
+    # 对外仍是 80（保持 URL 不变），容器内实际监听 8080 ——
+    # 因为非 root 进程不能绑定 <1024 的特权端口，见 frontend-deployment.yaml 的说明。
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
