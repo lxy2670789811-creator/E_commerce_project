@@ -112,6 +112,9 @@ ecommerce:
     jwt:
       secret: ${JWT_SECRET:ecommerce-order-demo-secret-key-please-change-in-prod-0123456789}  # HMAC 签名密钥，≥32字节
       expire-seconds: 86400      # token 有效期（秒），默认 1 天
+      # ⚠️ 切 true 之前，先确认 WebConfig 白名单已包含 /actuator/**：
+      #    K8s 探针是集群内部发起、不带 token 的 GET，被 401 掉就会让 readiness 永远失败，
+      #    所有 Pod 被摘出 Service（现象：Pod 全 Running 却不接流量）。
       required: false            # 硬鉴权开关：true=受保护路径必须带有效token；false=兼容模式（缺token放行，用userId参数）
       allow-plain-text-login: true  # 允许存量明文密码自动升级为 BCrypt（生产稳定后可置 false）
 
@@ -150,9 +153,15 @@ feign:
 # ⚠️ 两个探针的语义不能混 —— 这是最容易配错、后果也最严重的一处：
 #   liveness  = "进程是不是卡死了"，失败 → K8s 重启容器
 #   readiness = "现在能不能接流量"，失败 → K8s 只把 Pod 从 Service 摘掉，不重启
-#   所以 DB / Redis / RocketMQ 的健康度只能进 readiness。
-#   一旦把 Redis 连通性放进 liveness，Redis 抖一下 K8s 就会把**所有** Pod 重启 ——
-#   本来只是"暂时不可用"，会被放大成"全站崩溃"。
+#   所以 DB / Redis / RocketMQ 的健康度只能进 readiness，绝不能进 liveness。
+#
+# ⚠️⚠️ 下面 group.include 是**必须显式写**的，不能依赖默认值（2026-09-16 实测结论）：
+#   打开 probes.enabled 之后，liveness 与 readiness 两个分组的默认行为是
+#   **都包含全部健康指示器**（db / redis / nacosConfig / sentinel / diskSpace / ping ...），
+#   两个分组实测列出的组件**完全相同**。
+#   这意味着：不写 include，就等于让 liveness 探针去查数据库和 Redis ——
+#   MySQL 抖一下，K8s 会把所有 Pod 逐个重启，正是上面那句警告描述的"全站崩溃"。
+#   （我原先按 Spring Boot 的默认分组语义推断"liveness 只含 livenessState"，被实测推翻。）
 management:
   endpoints:
     web:
@@ -164,7 +173,28 @@ management:
     health:
       probes:
         enabled: true      # 启用 liveness / readiness 分组（默认只有聚合的 /health）
-      show-details: never  # 探针端点不返回 DB 地址、磁盘用量等内部细节
+      show-details: never  # 不返回 DB 地址、磁盘用量等内部细节
+      show-components: never  # group 端点同样不列组件清单。
+                              # 实测：group 端点即使全局 show-details=always 也不显示组件，
+                              # 这里显式固化下来，避免以后被人误改后把内部依赖清单暴露出去。
+      group:
+        # liveness 只认"进程自身状态"这一个信号，任何外部依赖都不许进。
+        # livenessState 在 ApplicationStartedEvent 时被置为 CORRECT，
+        # 之后只要不出现不可恢复的内部错误就一直是 UP —— 这才是存活探针该有的语义。
+        liveness:
+          include: livenessState
+        # readiness 只认"应用自身是否就绪"（ApplicationReadyEvent 之后为 ACCEPTING_TRAFFIC）。
+        #
+        # 为什么**不**把 db / redis 也放进来（有争议的取舍，理由如下）：
+        #   1. 本项目的依赖抖动都有明确降级路径 —— AI 链路有 fallback、缓存有降级直查 DB、
+        #      MQ 不可用有定时扫描兜底。局部降级不该让整个 Pod 退出流量。
+        #   2. 把 db 放进 readiness 的后果是"MySQL 抖一下 → 所有 Pod 被判不健康 → 同时摘除
+        #      → 入口直接 503"。这并没有让服务变好，只是把故障从"应用报错"换成"入口 503"，
+        #      却把局部故障放大成了全站故障。依赖不可用应当靠告警和业务错误率来发现。
+        #   3. 若确实想改成"依赖挂了就摘流量"的保守策略，把 include 写成
+        #      readinessState,db,redis 即可 —— 但要知道上面第 2 条的代价。
+        readiness:
+          include: readinessState
   health:
     livenessstate:
       enabled: true
@@ -172,7 +202,21 @@ management:
       enabled: true
   info:
     env:
-      enabled: true        # 发布后可通过 /api/actuator/info 核对跑的是哪个 profile
+      enabled: true        # 让 EnvironmentInfoContributor 把下面的顶层 info.* 属性暴露到端点
+
+# 顶层 info 段：配合上面的 management.info.env.enabled=true，这些值会出现在 /api/actuator/info。
+# 作用很实际 —— 部署后 curl 一次就能核对"跑的是哪个版本、哪个 profile"，不用登机器看启动参数。
+# ⚠️ 实测发现：不加这一段时 /api/actuator/info 返回的是空对象 {}，
+#    端点不会自动带出版本信息，没有 info.* 属性就没有内容可显示
+#    （原先这里写着"可通过 info 核对 profile"，但没有配套属性，那个说法是空的）。
+info:
+  app:
+    name: ${spring.application.name}
+    profile: ${spring.profiles.active:default}
+  build:
+    # @project.version@ 由 spring-boot-starter-parent 的资源过滤替换（分隔符是 @）。
+    # 若发现这里原样输出了 @project.version@，说明过滤被 pom 里的 <resources> 覆盖掉了。
+    version: @project.version@
 
 # 端口取舍（刻意不与业务端口分离）：
 #   管理端点与业务共用 8080，外部访问由 Ingress 的路径规则拦截 /actuator。

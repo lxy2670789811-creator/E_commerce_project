@@ -42,6 +42,17 @@ public class WebConfig implements WebMvcConfigurer {
                         "/swagger-ui.html",
                         "/swagger-ui/**",
                         "/favicon.ico",
+
+                        // actuator 健康端点：K8s 的 liveness/readiness 探针是**集群内部发起的、
+                        // 不带 JWT 的主动 HTTP GET**，所以这里必须放行。
+                        // ⚠️ 一旦漏掉，ecommerce.jwt.required 切成 true 后探针会拿到 401 →
+                        //    readiness 永远失败 → K8s 把**所有** Pod 摘出 Service → 服务整体不接流量。
+                        //    这个故障形态是"Pod 全在 Running、日志毫无异常、入口 503"，极难定位。
+                        // 暴露面可控：只开 health/info 两个端点，health 的 show-details=never 不吐
+                        // 依赖明细；外部访问另由 Ingress 的 /api/actuator 屏蔽规则挡掉
+                        // （Pod 探针直接打容器端口，不经过 Ingress，两者不冲突）。
+                        "/actuator/**",
+
                         "/error");
     }
 }

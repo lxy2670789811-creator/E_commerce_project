@@ -15,6 +15,7 @@ public enum ErrorCode {
     UNAUTHORIZED(401, "未授权"),
     FORBIDDEN(403, "禁止访问"),
     NOT_FOUND(404, "资源不存在"),
+    METHOD_NOT_ALLOWED(405, "请求方法不支持"),
     // 业务错误 1000-1999
     PRODUCT_NOT_FOUND(1001, "商品不存在"),
     PRODUCT_OFF_SHELF(1002, "商品已下架"),
