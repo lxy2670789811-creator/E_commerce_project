@@ -119,6 +119,53 @@ CoreDNS 对集群外的名字会**转发给 Node 的 `/etc/resolv.conf`** 解析
 
 注意 `useSSL`：本地 compose 是 `useSSL=false`，云端 RDS 一般要求 SSL 并需要提供 CA 证书。
 
+## L2：配置中心落地（Nacos）
+
+K8s 侧还有一个必做项：**把 Nacos 里的配置真正建起来**。
+
+原先 `bootstrap.yml` 声明了三个 dataId（主配置 + `shared-configs` + `extension-configs`），
+但 Nacos 里**一个都没有创建**。Nacos 客户端在配置为空或连不上时**不会让应用启动失败**，
+只在日志里打一行 `Ignore the empty nacos configuration ...`，然后安静回落到代码默认值 ——
+也就是说「参数走 Nacos 热更新」这个能力一直只写在文档上。
+
+配置源现已版本化到 `deploy/nacos/`（详见其 [README](../nacos/README.md)），用脚本灌入：
+
+```bash
+# 命名空间按环境隔离：K8s 的 ConfigMap 里 NACOS_NAMESPACE=ecommerce-prod
+python tools/nacos_push_config.py --namespace ecommerce-prod --verify
+```
+
+⚠️ 三个坑，**现象都是「看起来成功了」**：
+
+1. **`tenant=public` 会静默丢配置** —— `public` 命名空间的真实 ID 是空字符串，控制台里的
+   "public" 只是展示名。传 `tenant=public` 时接口**照样返回 `true`，但配置不落库**。
+   脚本的 `_tenant_param()` 已处理。
+2. **发布后立刻读回可能拿到「上一次的旧值」**（不只是 404）。只对 404 重试的话，
+   会把「改失败了」误判成成功 —— 两个方向都会骗人。脚本两种都重试。
+3. **命名空间必须与应用侧 `NACOS_NAMESPACE` 一致**，否则 Pod 启动日志里的 `Ignore the empty` 会一直在。
+
+验证配置**真的**生效（不能只看「Pod 起来了」）：
+
+```bash
+# 1) 启动日志里不该再出现我们声明的那三个 dataId
+kubectl logs -n ecommerce deploy/ecommerce-backend | grep -a "Ignore the empty"
+#    期望：只剩下 e-commerce-order-backend-prod.yaml 与 e-commerce-order-backend
+#    —— 这两个是客户端自动尝试的 profile 级 / 无后缀 dataId，我们没声明要建，报空属正常。
+#    若 e-commerce-order-backend.yaml / ecommerce-common.yaml / ecommerce-business.yaml
+#    仍在报空，说明配置没推到应用正在读的那个命名空间。
+
+# 2) 热更新实测：改 TTL → 看 Redis 里新写入键的 TTL，全程不需要重启
+docker exec ecommerce-redis redis-cli -h 192.168.65.254 DEL ecommerce:product:detail:1
+# 在 Nacos 控制台把 ecommerce-business.yaml 的 product-detail-expire-seconds 改成 120、
+# product-detail-expire-jitter-seconds 改成 0 并发布，然后：
+kubectl -n ecommerce exec deploy/ecommerce-backend -- \
+  curl -s -o /dev/null "localhost:8080/api/product/detail?id=1"
+docker exec ecommerce-redis redis-cli -h 192.168.65.254 TTL ecommerce:product:detail:1   # 期望 ≈ 120
+```
+
+> 实测记录（2026-09-16）：改前 TTL **1826** 秒 → 改成 120 后 TTL **116** 秒 → 改回 3600 后 TTL **3663** 秒，
+> 全程未重启任何进程，两个方向都是热生效。
+
 ## 验证清单
 
 ```bash

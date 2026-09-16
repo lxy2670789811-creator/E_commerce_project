@@ -1,0 +1,24 @@
+# ============================================================
+# DataId : e-commerce-order-backend.yaml
+# Group  : ECOMMERCE_GROUP
+# 用途   : 本服务专属配置（dataId 默认取 ${spring.application.name}.yaml）
+# 加载   : 主配置（优先级最高），refresh: true
+# 灌入   : python tools/nacos_push_config.py
+# ============================================================
+#
+# 为什么日志级别放在配置中心
+# --------------------------
+# 它是**最典型的热更新场景**：线上出问题时最想做的事就是"把某个包的日志调到 debug
+# 看一眼"，但不能为了这一眼去重启服务（重启会中断在途请求、也会让偶发问题消失）。
+# Spring Cloud 的 LoggingRebinder 监听 EnvironmentChangeEvent，收到 Nacos 推送后
+# 会立刻把新级别应用到已存在的 Logger 上 —— 无需重启，也无需重新创建任何 Bean。
+#
+# ⚠️ 本文件的值与 application-prod.yml 的 logging 段保持一致。
+#    配置中心的优先级**高于** profile 文件，所以这里写什么、线上就是什么。
+#
+logging:
+  level:
+    com.ecommerce: info
+    # 这两个客户端在 info 级别下非常吵（每次连接/心跳都打日志），收敛到 warn。
+    org.redisson: warn
+    org.apache.rocketmq: warn

@@ -15,7 +15,7 @@
 | 用户 | **JWT 鉴权登录**：登录下发 Token，拦截器校验，`AuthContext`（ThreadLocal）传递身份，业务层取身份而非信任参数；收货地址管理（默认地址互斥） |
 | 订单 | **下单一次性凭证（幂等 Token）**：进入下单页 `GET /order/token` 领凭证、提交时 Lua 原子消耗（GETDEL），防双击/超时重试生成的重复订单与重复扣库存 |
 | AI 售后 | DeepSeek 大模型智能分析 + **五层保护**：动态开关 → Sentinel 熔断 → Redis 滑动窗口限流 → Feign 熔断 → 业务降级"待人工审核" |
-| 工程化 | 统一响应/全局异常（**HTTP 状态码语义分层**：业务失败 200 + code，传输层失败真实 4xx/5xx）、MapStruct、Knife4j 接口文档、Nacos 动态配置、多环境 profile、Docker Compose、**HikariCP 连接池护栏调优**、67 个测试（含并发防超卖集成测试） |
+| 工程化 | 统一响应/全局异常（**HTTP 状态码语义分层**：业务失败 200 + code，传输层失败真实 4xx/5xx）、MapStruct、Knife4j 接口文档、Nacos 动态配置、多环境 profile、Docker Compose、**HikariCP 连接池护栏调优**、75 个测试（含并发防超卖集成测试） |
 | 云原生 | **容器化就绪（L0）+ K8s 编排（L1）**：Actuator 存活/就绪探针（分组显式收敛）、**优雅停机**、**定时扫描多副本 Redisson 选主**、非 root 运行的多阶段镜像；**K8s 清单**（Deployment / Service / Ingress / HPA / PDB / ConfigMap / Secret 模板 + 前端 nginx 镜像与配置分离）；应用本身无状态（JWT + Redis 锁/限流 + 无本地缓存与文件），可直接水平扩缩 |
 
 ## 技术栈
@@ -105,7 +105,7 @@ npm run dev   # http://localhost:5173
 mvn clean test
 ```
 
-共 **73 个测试**，重点：
+共 **75 个测试**，重点：
 
 - `OrderConcurrencyIntegrationTest`：真实 MySQL + Redis 并发防超卖（40 线程抢 20 库存 → 恰好 20 单、库存归 0、无超卖）
 - `OrderServiceImplTest`：下单/取消/支付回调/发货/完成/超时关单等 22 个核心路径
@@ -118,6 +118,7 @@ mvn clean test
 - `OrderTimeoutScanSchedulerLeaderElectionTest`：**多副本选主**——抢到锁才扫描并释放、抢不到锁**连 DB 查询都不发生**（这是"不再重复扫描"的直接证据）、租约过期时跳过 `unlock()` 且不抛 `IllegalMonitorStateException`、抢锁被中断则放弃本轮。已做变异验证：去掉选主的 `return` 后准确报红
 - `GlobalExceptionHandlerTest`：**HTTP 状态码语义**——未映射路径与未暴露的 actuator 端点返回真实 404（而不是被兜底包成 HTTP 200 + `code 5000`）、方法不支持返回 405 且按 RFC 9110 带 `Allow` 头、未预期异常返回 500、框架级 `ErrorResponse` 沿用其自带状态码；另有**对照组锁定「业务异常仍是 HTTP 200」这条既有约定不被误改**
 - `RedisConfigPasswordNormalizerTest`：**空密码归一化**——`redisson-spring-boot-starter` 把 `spring.data.redis.password` 原样交给 Redisson 且**没有空值守卫**，而 Redisson 判"要不要发 AUTH"看的是 password 是否为 null，于是 `application-prod.yml` 里 `${REDIS_PASSWORD:}` 解析出的**空串**会发出一条 `AUTH ""`，对无密码 Redis 直接报 `ERR Client sent AUTH, but no password is set` 并把启动打挂（dev 因为压根没写这一行而是 null，所以一直没暴露）。用例锁定"空串/纯空格/null 都归一化成 null"，并含**防修过头的对照**——配了真密码必须原样保留；已做变异验证：模拟"无条件清空密码"后该对照组准确报红
+- `JwtPropertiesBindingTest`：**配置前缀错位导致的静默失效**——`JwtProperties` 的前缀是 `ecommerce.jwt`，但 `application.yml` 里的 `jwt:` 段曾缩进在 `business:` 之下（绑定路径成了 `ecommerce.business.jwt`）；而 `BusinessDynamicConfig` 并不含 jwt 字段、`JwtProperties` 又只认前者，于是这段配置**没有任何读取方**——`JWT_SECRET` 环境变量从未生效，一直在用仓库里的硬编码密钥。危险之处在于 `@ConfigurationProperties` 绑不到属性时**不报错**，只是安静保留代码默认值，从日志到运行现象都看不出来。用例直接用 `Binder` 读 `application.yml` 断言该前缀（不启动 Spring 上下文、不依赖任何中间件）
 
 > 集成测试使用独立测试库 `ecommerce_test`（自动创建）与 Redis DB15，不污染开发数据；
 > 测试 profile 已禁用 Nacos/Sentinel/RocketMQ，无需额外中间件。

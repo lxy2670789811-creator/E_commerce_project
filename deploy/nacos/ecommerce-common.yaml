@@ -1,0 +1,26 @@
+# ============================================================
+# DataId : ecommerce-common.yaml
+# Group  : ECOMMERCE_GROUP
+# 用途   : 多服务**共用**的公共约定（bootstrap.yml 的 shared-configs）
+# 加载   : shared-configs，refresh: true
+# 灌入   : python tools/nacos_push_config.py
+# ============================================================
+#
+# 定位说明
+# --------
+# 本项目目前是单体，这个 dataId 的价值在于「把公共约定从服务私有配置里拆出来」——
+# 将来按商品 / 订单 / 用户拆微服务时，各服务的 bootstrap.yml 只要挂上这个 shared-config，
+# 序列化格式、日志格式这类"全公司必须一致"的东西就只有一份真实来源，
+# 不会出现「A 服务返回 yyyy-MM-dd、B 服务返回时间戳」这种前端要写两套兼容逻辑的问题。
+#
+# ⚠️ 放进这里的值必须与 src/main/resources/application.yml 的公共段一致，
+#    否则等于用配置中心悄悄改了所有服务的序列化行为。
+#
+spring:
+  # Jackson 序列化统一约定：前后端约好的时间格式与时区，以及不返回 null 字段。
+  # ⚠️ date-format 会影响所有 @JsonFormat 未显式指定的字段，改动属于**接口契约变更**，
+  #    热更新后立即对新老请求同时生效，灰度期间要格外小心。
+  jackson:
+    date-format: yyyy-MM-dd HH:mm:ss
+    time-zone: Asia/Shanghai
+    default-property-inclusion: non_null

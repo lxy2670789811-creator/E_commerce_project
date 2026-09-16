@@ -1,0 +1,98 @@
+# ============================================================
+# DataId : ecommerce-business.yaml
+# Group  : ECOMMERCE_GROUP
+# 用途   : 业务动态参数（对应 BusinessDynamicConfig，前缀 ecommerce.business）
+# 加载   : bootstrap.yml 的 extension-configs，refresh: true → 改完 **无需重启** 即生效
+# 灌入   : python tools/nacos_push_config.py  （见 deploy/nacos/README.md）
+# ============================================================
+#
+# 设计约定
+# --------
+# 1. 本文件是「运行时可覆盖层」。application.yml 里仍保留同一套默认值，
+#    目的是让单元测试、离线开发、docker-compose 不依赖配置中心也能跑起来。
+#    ⚠️ 两边的值必须保持一致，否则会出现「本地测得对、集群行为不一样」的诡异现象。
+#
+# 2. **敏感信息绝不进配置中心**：DB/Redis 密码、JWT secret、DeepSeek API Key
+#    一律走 K8s Secret → 环境变量注入。配置中心只放可公开的业务开关与阈值。
+#
+# 3. 这些参数对应的都是「可灰度、可回滚」的运行时行为（缓存 TTL、限流阈值、
+#    功能开关、扫描频率），改错只会影响行为、不影响启动，因此适合放配置中心热调。
+#
+ecommerce:
+  business:
+    # ==================== 分布式锁 ====================
+    # 库存扣减锁持有超时（秒）。设为 -1 启用 Redisson 看门狗自动续期。
+    # ⚠️ 与缓存重建锁不同：库存锁内是事务写操作，必须等事务提交后再释放，
+    #    所以用固定 lease 而非短 lease —— 见 OrderServiceImpl 的解锁时序。
+    inventory-lock-lease-seconds: 30
+    # 库存锁最大等待（秒）。超过则快速失败，避免请求在线程池上堆积。
+    inventory-lock-wait-seconds: 5
+
+    # ==================== AI 大模型 ====================
+    ai-api-timeout-seconds: 30
+    # 重试次数 0~3。非幂等接口不宜设大（重试会重复计费）。
+    ai-api-retry-times: 1
+    # 售后功能总开关：置 false 可一键摘掉整条 AI 链路（应急止血）。
+    after-support-enabled: true
+    ai-rate-limit-max-requests: 10
+    ai-rate-limit-time-window-seconds: 60
+
+    # ==================== Sentinel 熔断兜底阈值 ====================
+    # ⚠️ Sentinel 控制台配置优先于这里；此处仅作「控制台不可用/规则丢失」时的兜底。
+    order-create-qps-threshold: 100
+    ai-analyze-slow-ratio-threshold: 0.6
+    ai-analyze-min-request-amount: 5
+    ai-analyze-stat-interval-ms: 60000
+    ai-analyze-time-window: 30
+    deepseek-error-ratio-threshold: 0.5
+
+    # ==================== 商品详情缓存 ====================
+    # 命中缓存后写入的 TTL。改小 = 一致性更好、DB 压力更大。
+    product-detail-expire-seconds: 3600
+    # 防雪崩：实际 TTL = expire-seconds + random[0, jitter]。0 = 关闭抖动。
+    product-detail-expire-jitter-seconds: 300
+    # 防穿透：DB 查不到时写空值标记的 TTL。0 = 关闭。
+    # ⚠️ 必须远小于正常 TTL，否则商品后来上架了会长时间查不到。
+    product-detail-null-cache-expire-seconds: 120
+    # 防击穿（singleflight 互斥重建）总开关。
+    product-detail-rebuild-lock-enabled: true
+    # 重建锁 lease（秒）。≈ 回源超时上限，**非越大越安全**：
+    # 约束是 lease > 等待预算 + 回源上限。当前 5 > 1 + ~3。
+    product-detail-rebuild-lock-lease-seconds: 5
+    # 等待重建结果的**总预算**（毫秒，硬上限）。耗尽即降级查 DB。0 = 不等。
+    product-detail-rebuild-lock-budget-millis: 1000
+    # 等待的起始片长（毫秒）。每轮翻倍并带 ±50% 抖动，避免 follower 同时醒来。
+    product-detail-rebuild-lock-backoff-millis: 20
+    # 降级直查 DB 的并发闸门（0 = 不封顶）。超出快速失败返回 SYSTEM_BUSY。
+    # ⚠️ 降级**不得**改为返回兜底值 —— 详情含价格与库存，兜底即业务事故。
+    product-detail-rebuild-lock-degrade-max-concurrency: 8
+
+    # ==================== 商品列表缓存（默认首页无筛选商品流） ====================
+    product-list-cache-enabled: true
+    # 短 TTL 兜底一致性：列表不含库存语义，可以容忍读旧值。
+    product-list-expire-seconds: 120
+    # 空结果缓存 TTL（防穿透）。0 = 关闭。
+    product-list-null-cache-expire-seconds: 30
+
+    # ==================== 订单超时未支付自动关单 ====================
+    # 主通道：RocketMQ 延迟消息。兜底：定时扫描（下面几项）。
+    order-timeout-cancel-enabled: true
+    # RocketMQ 延迟级别，9 = 5 分钟。须与 order-timeout-seconds 对齐。
+    order-timeout-cancel-delay-level: 9
+    # 细粒度扫描开关。⚠️ 受 MQ 健康门控：MQ 正常时本任务直接返回、零 DB 查询。
+    order-timeout-scan-enabled: true
+    # Spring 6 位 cron 格式（秒 分 时 日 月 周）。改这里可热调扫描频率。
+    order-timeout-scan-cron: "0 */1 * * * ?"
+    # 超时阈值（秒）。
+    order-timeout-seconds: 300
+    # 单批处理上限。调大须同步调大锁的 lease。
+    order-timeout-scan-batch-size: 100
+    # 粗粒度对账开关（**独立于 MQ 健康标志**，固定周期强制扫描）。
+    # 用途：堵住「异步发送回调未执行、健康标志未翻转」的极端窗口。
+    order-timeout-scan-coarse-enabled: true
+    order-timeout-scan-coarse-cron: "0 0/10 * * * ?"
+
+    # ==================== 下单幂等（一次性凭证） ====================
+    order-token-enabled: true
+    # 凭证有效期（秒）。Redis 故障时 fail-open 放行，由 DB 唯一索引兜底。
+    order-token-expire-seconds: 300
