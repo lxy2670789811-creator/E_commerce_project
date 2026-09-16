@@ -1,0 +1,84 @@
+# ==================== kind 本地验证专用：让 host.docker.internal 可解析 ====================
+#
+# 为什么需要这个文件（实测结论，2026-09-16）
+# ---------------------------------------------------------------------------
+# 覆盖层把 5 个 ExternalName Service 的目标改成了 `host.docker.internal`，
+# 但实测发现这个域名在 kind 集群里**根本解析不了**，链路断在最后一跳：
+#
+#   应用 Pod 查 mysql.ecommerce.svc.cluster.local
+#     → CoreDNS 的 kubernetes 插件答一个 CNAME: host.docker.internal
+#       → Pod 拿着 CNAME 再查 host.docker.internal
+#         → CoreDNS 一路 fallthrough 到 `forward . /etc/resolv.conf`
+#           → 节点 resolv.conf 指向 172.20.0.1（Docker 内嵌 DNS）
+#             → ✗ NXDOMAIN      ← 断在这里
+#
+# 排查过程（关键是做了对照实验，避免误判）：
+#   1. 节点内 `cat /etc/nsswitch.conf` → `hosts: files dns`
+#      ⇒ getent **确实会查 DNS**，所以"解析不出来"不是 getent 的锅
+#   2. `getent hosts www.baidu.com` → 正常返回 IPv6 地址
+#      ⇒ DNS 链路本身通的，能出去
+#   3. `getent hosts host.docker.internal` → 空
+#   4. 换普通容器验证：`docker run --network kind busybox nslookup host.docker.internal`
+#      → 内嵌 DNS（127.0.0.11）明确回 **NXDOMAIN**
+#
+# 根因：Docker Desktop 提供 host.docker.internal 的方式是**写进容器的 /etc/hosts**，
+#       不是靠 DNS 应答。而 kind 节点容器（以及 Pod）的 /etc/hosts 里没有它，
+#       集群 DNS 也答不出来 —— 两条路都堵死。
+#
+# ⚠️ 顺带澄清一个本机容易混淆的点：**地址可达性和 DNS 是两件独立的事**
+#   节点上测 172.20.0.1（kind 网桥网关）：
+#       6379 / 8848 / 9876 / 8858  OPEN   ← 这些是**容器**，发布了端口，网关可达
+#       3306                       CLOSED ← 这是 **Windows 原生 MySQL**，没发布
+#   而 192.168.65.254（Docker Desktop 通往 Windows 宿主机）：
+#       3306 / 6379 / 8848 / 9876  全 OPEN
+#   192.168.65.254 的来源：`docker run --add-host=host.docker.internal:host-gateway`
+#   会把它写进 /etc/hosts，这就是 Docker 认定的"宿主机"地址。
+#
+# 解法：用 CoreDNS 的 hosts 插件，在集群 DNS 里为 host.docker.internal 补一条静态记录。
+#      这样 **ExternalName → CNAME → 宿主机** 整条链路能原样走通，
+#      覆盖层不必为了绕开 DNS 而去用 hostAliases 把 ExternalName 整个短路掉
+#      （那样就验证不到 ExternalName 到底有没有生成正确的 CNAME 了）。
+#
+# ⚠️ 这是**集群级**改动，且与业务清单无关，所以刻意不放进 kustomization 的 resources：
+#    base/overlay 的 kustomization 都带 `namespace: ecommerce`，
+#    一旦把 kube-system 的东西混进去，CoreDNS 会被搬到 ecommerce 命名空间里 —— 直接搞坏集群。
+#    用法是单独 apply：
+#      kubectl apply -f deploy/overlays/kind-verify/coredns-hosts.yaml
+#      kubectl -n kube-system rollout restart deployment coredns
+#
+# ⚠️ 192.168.65.254 是 Docker Desktop 在本机的固定网关地址，换机器/重装 Docker 可能变。
+#    变了就重新用 `--add-host=host.docker.internal:host-gateway` 探一次。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns
+  namespace: kube-system
+data:
+  Corefile: |
+    .:53 {
+        errors
+        health {
+           lameduck 5s
+        }
+        ready
+        hosts {
+            192.168.65.254 host.docker.internal
+            fallthrough
+        }
+        kubernetes cluster.local in-addr.arpa ip6.arpa {
+           pods insecure
+           fallthrough in-addr.arpa ip6.arpa
+           ttl 30
+        }
+        prometheus :9153
+        forward . /etc/resolv.conf {
+           max_concurrent 1000
+        }
+        cache 30 {
+           disable success cluster.local
+           disable denial cluster.local
+        }
+        loop
+        reload
+        loadbalance
+    }

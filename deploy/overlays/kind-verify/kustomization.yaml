@@ -1,0 +1,186 @@
+# ==================== kind 本地验证覆盖层 ====================
+#
+# 用途：在没有云托管中间件的情况下，用本地 kind 集群**真实 apply 一遍**清单，
+#       验证那些"只靠渲染校验证明不了"的东西 —— 主要是：
+#         1. 清单能被 apiserver 接受（schema 合法性、必填字段、枚举值）
+#         2. ExternalName Service 真的能生成 DNS CNAME、Pod 里真的解析得到
+#         3. enforcement 类字段（runAsNonRoot / readOnlyRootFilesystem / seccomp）会不会让容器起不来
+#         4. 探针在真实 kubelet 下是否真的被调用、Pod 是否真的变 Ready
+#         5. 优雅停机在真实 SIGTERM 下的行为（本地 Windows 发不了 SIGTERM，只能在这里验）
+#
+# ⚠️ 这不是生产部署路径。它把云托管地址临时改指向宿主机上跑着的 MySQL/Redis，
+#    目的只是让应用真的能启动起来。生产用 `kubectl apply -k deploy/k8s`（base）。
+#
+# 用法：
+#   # 1. 起集群
+#   kind create cluster --name ecommerce-verify
+#   # 2. 把镜像塞进集群（kind 不共享宿主机的镜像缓存）
+#   kind load docker-image ecommerce-backend:l2-verify --name ecommerce-verify
+#   # 3. 让 host.docker.internal 在集群内可解析（不然 ExternalName 的 CNAME 链断在最后一跳）
+#   kubectl apply -f deploy/overlays/kind-verify/coredns-hosts.yaml
+#   kubectl -n kube-system rollout restart deployment coredns
+#   # 4. 先建 Secret（base 刻意不含 secret.example.yaml，见其注释）
+#   kubectl create secret generic ecommerce-backend-secret -n ecommerce \
+#     --from-literal=MYSQL_USERNAME=root --from-literal=MYSQL_PASSWORD=123456 \
+#     --from-literal=REDIS_PASSWORD= --from-literal=JWT_SECRET=<48字节随机串> \
+#     --from-literal=DEEPSEEK_API_KEY=sk-dummy
+#   # 5. 应用覆盖层
+#   kubectl apply -k deploy/overlays/kind-verify
+#
+# 前置：宿主机 MySQL(3306) 与 Redis(6379) 已在运行。
+#       ⚠️ 宿主机 MySQL 必须是"能从容器网络访问到"的那个 —— 见下方实测说明。
+#
+# ⚠️ 顺序不能颠倒：Step 3 必须在 Step 5 之前。否则 Pod 会先拿着解析不了的
+#    CNAME 去连 Redis，启动失败并进入 CrashLoopBackOff，看起来像应用本身的 bug。
+#
+# ⚠️ 为什么覆盖层放在 deploy/overlays/ 而不是 deploy/k8s/overlays/ ：
+#    kustomize 有一条硬性限制 —— overlay 不能位于 base 目录**内部**，否则报
+#    "cycle detected: candidate root ... contains visited root ..."。
+#    因为 base 与 overlay 互为对方的子树，kustomize 无法判定加载边界。
+#    所以同一层级的 `deploy/overlays/` 是这类布局的常规做法（base 与 overlays 平级）。
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: ecommerce
+
+resources:
+  - ../../k8s
+
+# ---------------------------------------------------------------------------
+# 补丁 1：把 5 个 ExternalName 全部指向宿主机
+# ---------------------------------------------------------------------------
+# host.docker.internal 是 Docker Desktop 提供的特殊 DNS 名，指向宿主机。
+# kind 的节点是 Docker 容器，与 compose 的容器不在同一个 Docker 网络上，
+# 所以不能直接按容器名互访 —— 走"宿主机 + compose 发布的端口"这条路。
+#
+# 实测（2026-09-16）宿主机上真实在跑的东西：
+#   3306  MySQL（本机原生服务，**不是**容器） UP
+#   6379  Redis（compose）                    UP
+#   8848  Nacos HTTP + 9848 Nacos gRPC        UP  ← 9848 必须一起通，Nacos 2.x 配置拉取走 gRPC
+#   9876  RocketMQ NameServer（compose）      UP
+#   10911 RocketMQ Broker                     DOWN ← 容器 Exited(137) 11 天，只有 NameServer 活着
+#   8858  Sentinel Dashboard（compose）       UP
+#
+# ⚠️ 地址必须用 192.168.65.254，不能用 kind 网桥网关 172.20.0.1 —— 这是本次实测最容易踩错的一点：
+#     172.20.0.1 :  6379/8848/9876/8858 → OPEN    （这些是**容器**且发布了端口，docker-proxy 绑在网关上）
+#     172.20.0.1 :  3306                → CLOSED  （MySQL 是 Windows 原生服务，没有发布端口）
+#     192.168.65.254 : 3306/6379/8848/9876 → 全 OPEN
+#   192.168.65.254 就是 Docker Desktop 认定的"宿主机"地址，用
+#   `docker run --add-host=host.docker.internal:host-gateway ...` 可以把它打出来。
+#   注意 172.20.0.1:3306 不通这件事**不会**报连接拒绝以外的额外线索，
+#   排查时很容易误判成"MySQL 没启动"，而实际是"地址选错了"。
+#
+# ⚠️ host.docker.internal 在集群里默认**解析不了**（Docker 内嵌 DNS 回 NXDOMAIN），
+#    必须先用 coredns-hosts.yaml 在 CoreDNS 里补一条静态记录。原因与排查过程写在那个文件里。
+#
+# ⚠️ 这里顺带验证了 README 里那条限制：externalName 必须是**域名**。
+#    若写成 172.17.0.1 这类 IP，apiserver 会直接拒绝（CNAME 不能指向 IP）。
+#
+# RocketMQ 只有 NameServer 活着这件事对本次验证是**有价值**的：
+#   它正好检验项目一直声称的一条设计 ——「MQ 不可用不影响下单主流程，
+#   超时关单由定时扫描兜底补偿」。若应用因为这个起不来，说明那条说法站不住。
+patches:
+  - target:
+      kind: Service
+      name: mysql
+    patch: |-
+      - op: replace
+        path: /spec/externalName
+        value: host.docker.internal
+  - target:
+      kind: Service
+      name: redis
+    patch: |-
+      - op: replace
+        path: /spec/externalName
+        value: host.docker.internal
+  # 五条全部指向宿主机（含 Nacos / Sentinel / RocketMQ，它们实测都在跑）
+  - target:
+      kind: Service
+      name: rocketmq-namesrv
+    patch: |-
+      - op: replace
+        path: /spec/externalName
+        value: host.docker.internal
+  - target:
+      kind: Service
+      name: nacos
+    patch: |-
+      - op: replace
+        path: /spec/externalName
+        value: host.docker.internal
+  - target:
+      kind: Service
+      name: sentinel-dashboard
+    patch: |-
+      - op: replace
+        path: /spec/externalName
+        value: host.docker.internal
+
+# ---------------------------------------------------------------------------
+# 补丁 2：MySQL 连接串去掉 SSL
+# ---------------------------------------------------------------------------
+# base 里写的是 useSSL=true（云托管 RDS 的常态），但本机 MySQL 没配 SSL，
+# 不改会直接握手失败。这也是 README「本地 compose ↔ 云端托管切换对照」里
+# 提到的那一处差异 —— 在这里被真实踩到一次。
+  - target:
+      kind: ConfigMap
+      name: ecommerce-backend-config
+    patch: |-
+      - op: replace
+        path: /data/MYSQL_URL
+        value: "jdbc:mysql://mysql.ecommerce.svc.cluster.local:3306/ecommerce?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true"
+
+# ---------------------------------------------------------------------------
+# 补丁 3：换成刚构建的本地镜像，并降到 1 副本
+# ---------------------------------------------------------------------------
+# imagePullPolicy 必须显式设成 Never：base 里是 IfNotPresent，而 kind load 进来的镜像
+# tag 是 l2-verify 这种非 latest 标签 —— 默认策略仍会尝试去 registry 拉，然后失败。
+# 这是 kind 上最常见的"镜像明明 load 了就报 ImagePullBackOff"的原因。
+  - target:
+      kind: Deployment
+      name: ecommerce-backend
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 1
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: ecommerce-backend:l2-verify
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: Never
+
+  # 前端同理。它的镜像已用 `docker build -t ecommerce-frontend:l2-verify frontend/` 构建成功，
+  # 证明 frontend/Dockerfile（node 构建阶段 + nginx-unprivileged 运行阶段）可用。
+  # 同样降到 1 副本。
+  - target:
+      kind: Deployment
+      name: ecommerce-frontend
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 1
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: ecommerce-frontend:l2-verify
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: Never
+
+# ---------------------------------------------------------------------------
+# 补丁 4：删掉 HPA
+# ---------------------------------------------------------------------------
+# 本地 kind 没装 metrics-server，HPA 拿不到指标会持续报错刷事件，
+# 而它的 minReplicas=2 还有机会把副本数拉回 2，干扰"单副本验证"。
+# base 里的 HPA 已经在 `kubectl apply -k deploy/k8s --dry-run=server` 阶段验证过合法性，
+# 这里删掉不影响那项验证结论。
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: ecommerce-backend
+    patch: |-
+      $patch: delete
+      apiVersion: autoscaling/v2
+      kind: HorizontalPodAutoscaler
+      metadata:
+        name: ecommerce-backend

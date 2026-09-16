@@ -16,6 +16,13 @@ namespace: ecommerce
 resources:
   - namespace.yaml
 
+  # ---- 中间件（L2：云托管接入）----
+  # 提供 mysql / redis / rocketmq-namesrv / nacos / sentinel-dashboard 这 5 个
+  # 集群内 DNS 名，configmap.yaml 里的连接串直接引用它们。
+  # 必须排在 configmap 之前虽然对 apply 顺序无影响（kubectl 会自己排序），
+  # 但按依赖从下往上读更清楚：中间件地址 -> 配置 -> 应用。
+  - middleware-external.yaml
+
   # ---- 后端 ----
   - configmap.yaml
   - deployment.yaml

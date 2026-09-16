@@ -9,6 +9,10 @@
 # ⚠️ 地址一律写内网域名 / 云托管连接串，不要写宿主机 IP：
 #    容器里的 127.0.0.1 是 Pod 自己，写 localhost 会把"连不上数据库"变成
 #    一次毫无头绪的排查（这也是 docker-compose 迁到 K8s 最常见的翻车点）。
+#
+# 下面这 5 个集群内 DNS 名，都由 middleware-external.yaml 里的 ExternalName Service 提供
+# （L2 补充：在 L2 之前这些名字是引用不到的 —— 配置写了、Service 不存在）。
+# 改云厂商 / 换区域时**只改 middleware-external.yaml 里的 externalName**，本文件不用动。
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -29,6 +33,14 @@ data:
 
   # --- RocketMQ ---
   ROCKETMQ_NAME_SERVER: "rocketmq-namesrv.ecommerce.svc.cluster.local:9876"
+  # ⚠️ NameServer 地址只是"问路"，不是"通信地址"。客户端先问 NameServer 要 Topic 的
+  #    路由信息，**Broker 会把自己对外宣告的地址（brokerIP1）回给客户端，客户端再直连它**。
+  #    所以真正决定能不能发消息的是 brokerIP1，而不是上面这行。
+  #    踩坑形态：NameServer 连得上、路由也拿得到，但发消息超时 —— 因为 brokerIP1 宣告的是
+  #    它在自己网络里的地址（如容器内网 IP / 云主机私网 IP），Pod 根本到不了。
+  #    本地 compose 场景同样踩过这个坑，解法是 broker.conf 里显式指定 brokerIP1
+  #    （见 deploy/rocketmq/broker.conf，那里写的是 host.docker.internal）。
+  #    用云托管 MQ 时厂商已处理；自建则必须在 broker.conf 里写 Pod 可达的地址。
 
   # --- Sentinel Dashboard ---
   # 只影响规则可视化，连不上不影响业务（规则在应用启动时由 SentinelConfig 注册）。

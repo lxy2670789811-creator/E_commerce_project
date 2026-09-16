@@ -1,0 +1,199 @@
+# ==================== L2：云托管中间件接入 ====================
+#
+# 这个文件解决的是一笔"欠账"：
+#   L1 的 configmap.yaml 里已经把这些地址写成了集群内 DNS 名 ——
+#     mysql.ecommerce.svc.cluster.local:3306
+#     redis.ecommerce.svc.cluster.local:6379
+#     rocketmq-namesrv.ecommerce.svc.cluster.local:9876
+#     nacos.ecommerce.svc.cluster.local:8848
+#     sentinel-dashboard.ecommerce.svc.cluster.local:8858
+#   但在 L2 之前，集群里**并不存在**这 5 个 Service，这些名字根本解析不了。
+#   本文件就是把这些名字背后的东西接上（指向云托管实例）。
+#
+# 为什么中间件用云托管而不是自建 StatefulSet：
+#   MySQL / Redis / RocketMQ / Nacos 都是有状态组件，自建要处理 PVC、备份、
+#   故障转移、版本升级、监控告警 —— 这是运维工作量，对 Java 后端岗的边际收益低。
+#   详细取舍见 work/云原生改造可行性与工程量评估.html 第五节。
+#   本地开发仍用 docker-compose.yml，形成「本地 compose + 云端托管」的混合模式。
+#
+# ---------------------------------------------------------------------------
+# ExternalName 的机制（面试常被追问，这里一次说清）
+# ---------------------------------------------------------------------------
+# ExternalName 类型的 Service **没有 ClusterIP，也不经过 kube-proxy**，
+# 它只是在 CoreDNS 里生成一条 CNAME 记录：
+#     mysql.ecommerce.svc.cluster.local  ->  CNAME  ->  rm-xxx.mysql.rds.xxx.com
+# 客户端拿到 CNAME 后自己去解析、自己直连，数据平面完全不参与。
+#
+# 由此带来三个必须知道的限制：
+#
+# ① **端口不能重映射**。ExternalName 不支持 targetPort 转换：客户端连的是
+#    Service 的 port 号，而这个号码会原样带到远端主机上。
+#    本项目的云托管端口正好与本地一致（3306 / 6379 / 9876 / 8848 / 8858），
+#    所以能用；**若云厂商给的端口与集群内约定不同，这个方案直接不成立**，
+#    必须换成本文件末尾的「备选方案」（无 selector 的 ClusterIP + 手写 Endpoints）。
+#
+# ② **NetworkPolicy 管不住它**。这是最容易踩、也最反直觉的一条：
+#    NetworkPolicy 是按 ClusterIP / Pod selector 匹配的，而 ExternalName
+#    压根没有 ClusterIP，流量是 Pod 直接发往外部地址。
+#    于是「想用 NetworkPolicy 精确限制 Pod 只能访问这几个中间件」做不到 ——
+#    一旦你为 Pod 应用了任何 egress 规则，ExternalName 的流量会被**整体拒绝**
+#    （egress 默认拒绝未放行的），表现为连接超时且看不出原因。
+#    需要按 selector 管控出流量，就必须用 Endpoints 方案。
+#
+# ③ **externalName 必须是 DNS 名，不能写 IP**（CNAME 指向 IP 是非法的，
+#    apiserver 会校验报错，kind 实测确认）。云厂商若只给了 IP 没给域名，
+#    同样只能走 Endpoints 方案。
+#
+# ⚠️ 还有一条与集群 DNS 有关的隐蔽坑（不属于 ExternalName 语法问题，但一定会在
+#    云内网域名上撞到）：CoreDNS 对集群外的名字会**转发给 Node 的 /etc/resolv.conf**
+#    解析。如果云托管实例的域名是**云厂商的 VPC 内网域名**（只能由 VPC 内 DNS 解析，
+#    公网或 Node 上的解析器解析不了），那么 Pod 里会得到 NXDOMAIN ——
+#    现象是「kubectl exec 进去 ping 不通、应用报 UnknownHostException」，
+#    而 Service 本身 kubectl get 一切正常。
+#    解法二选一：给 CoreDNS 配 forward 指向 VPC DNS，或换成 NodeLocal DNSCache 方案。
+#    这一条在本地 kind 上无法复现（kind 的 Node 就是容器，解析行为不同）。
+#
+# ---------------------------------------------------------------------------
+# 部署前必做：把下面所有 externalName 换成你的云托管实例地址
+# ---------------------------------------------------------------------------
+# 这是切换云厂商 / 区域时**唯一**要改的地方 —— configmap.yaml 里那 5 个集群内
+# DNS 名不用动。这正是引入 ExternalName 这一层的价值：把"厂商相关的地址"收敛到一处。
+# 用占位域名不是疏忽：这样应用连不上时的报错是 UnknownHostException（一眼看出是地址没配），
+# 而不是莫名其妙的认证失败。
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  labels:
+    app.kubernetes.io/name: ecommerce-middleware
+    app.kubernetes.io/component: database
+spec:
+  type: ExternalName
+  externalName: REPLACE-ME.mysql.rds.example.com
+  ports:
+    - name: mysql
+      port: 3306
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  labels:
+    app.kubernetes.io/name: ecommerce-middleware
+    app.kubernetes.io/component: cache
+spec:
+  type: ExternalName
+  externalName: REPLACE-ME.redis.example.com
+  ports:
+    - name: redis
+      port: 6379
+      protocol: TCP
+---
+# RocketMQ 这一条要特别小心 —— 见下方 brokerIP1 说明。
+# 这里接的是 NameServer；Broker 的地址是**由 Broker 自己回给客户端**的，不走这个 Service。
+apiVersion: v1
+kind: Service
+metadata:
+  name: rocketmq-namesrv
+  labels:
+    app.kubernetes.io/name: ecommerce-middleware
+    app.kubernetes.io/component: mq
+spec:
+  type: ExternalName
+  externalName: REPLACE-ME.rocketmq.aliyuncs.com
+  ports:
+    - name: namesrv
+      port: 9876
+      protocol: TCP
+---
+# Nacos 2.x 需要**两个端口**：8848（HTTP 配置/命名）与 9848（客户端 gRPC）。
+# 9848 的端口号是 8848+1000，由客户端从 NACOS_SERVER_ADDR 的端口自动推导，
+# **没有独立的环境变量可以配**。
+# 踩坑形态：只在云侧防火墙/白名单放行了 8848 -> 短连接（拉配置）能通，
+# 长连接（配置推送、服务订阅）静默失败 —— 表现为"配置改了不生效、
+# 但重启服务又能读到最新的"，极难定位。
+# 因此云侧安全组 / 白名单必须同时放行 8848 与 9848。
+apiVersion: v1
+kind: Service
+metadata:
+  name: nacos
+  labels:
+    app.kubernetes.io/name: ecommerce-middleware
+    app.kubernetes.io/component: config-center
+spec:
+  type: ExternalName
+  externalName: REPLACE-ME.mse.aliyuncs.com
+  ports:
+    - name: http
+      port: 8848
+      protocol: TCP
+    - name: grpc-client
+      port: 9848
+      protocol: TCP
+---
+# Sentinel Dashboard 只做规则可视化与推送，连不上不影响业务
+# （规则在应用启动时由 SentinelConfig 注册到本地内存）。
+# 但要注意：规则是**每副本各存一份**，Dashboard 推送也只到建立了心跳的实例 ——
+# 表现是"熔断时灵时不灵"。正式做法是接 datasource 做规则持久化（Nacos 数据源），
+# 本项目暂未做，见 configmap.yaml 里同一条说明。
+apiVersion: v1
+kind: Service
+metadata:
+  name: sentinel-dashboard
+  labels:
+    app.kubernetes.io/name: ecommerce-middleware
+    app.kubernetes.io/component: observability
+spec:
+  type: ExternalName
+  externalName: REPLACE-ME.sentinel.example.com
+  ports:
+    - name: http
+      port: 8858
+      protocol: TCP
+
+# ===========================================================================
+# 备选方案：无 selector 的 ClusterIP Service + 手写 Endpoints
+# ===========================================================================
+# 什么时候必须换成它：
+#   1. 云侧给的端口与集群内约定的端口不一致（ExternalName 不能重映射端口）
+#   2. 云侧只给了 IP，没有域名（CNAME 不能指向 IP）
+#   3. 需要用 NetworkPolicy 精确管控 Pod 的出流量（ExternalName 不进数据平面，管不到）
+#
+# 代价（所以没有默认用它）：
+#   - IP 要写死在 Endpoints 里；云实例换 IP（迁移、重建、切换可用区）时必须手动改，
+#     而且**改错了不会有任何报错** —— 只是连不上。ExternalName 走 DNS 就没这个问题。
+#   - 没有健康检查：Endpoints 里写多少个地址，kube-proxy 就转发多少个，
+#     其中的坏地址会一直参与转发（约 1/N 的请求失败），需要自己保证正确性。
+#
+# 用法：注掉上面同名的 ExternalName Service，放开下面这一段。
+# ---
+# apiVersion: v1
+# kind: Service
+# metadata:
+#   name: mysql
+#   labels:
+#     app.kubernetes.io/name: ecommerce-middleware
+#     app.kubernetes.io/component: database
+# spec:
+#   type: ClusterIP
+#   clusterIP: None          # 这里用普通 ClusterIP 也可以，用 None 是为了不占 IP 段
+#   ports:
+#     - name: mysql
+#       port: 3306
+#       protocol: TCP
+#       # 注意这里**没有** selector —— 有 selector 的话 kube-controller-manager
+#       # 会自动维护 Endpoints 并覆盖下面手写的内容，白写。
+# ---
+# apiVersion: v1
+# kind: Endpoints
+# metadata:
+#   name: mysql               # 名字必须与上面的 Service 完全一致，靠这个名字配对
+# subsets:
+#   - addresses:
+#       - ip: 10.0.1.100      # 云托管实例的真实 IP
+#     ports:
+#       - name: mysql
+#         port: 3306
+#         protocol: TCP

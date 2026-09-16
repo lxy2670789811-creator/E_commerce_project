@@ -105,7 +105,7 @@ npm run dev   # http://localhost:5173
 mvn clean test
 ```
 
-共 **67 个测试**，重点：
+共 **73 个测试**，重点：
 
 - `OrderConcurrencyIntegrationTest`：真实 MySQL + Redis 并发防超卖（40 线程抢 20 库存 → 恰好 20 单、库存归 0、无超卖）
 - `OrderServiceImplTest`：下单/取消/支付回调/发货/完成/超时关单等 22 个核心路径
@@ -117,6 +117,7 @@ mvn clean test
 - `ProductCacheSingleflightTest`：缓存击穿防护专项——singleflight 互斥重建的 leader 只回源一次、并发请求复用 leader 结果、二次查缓存命中不查 DB、开关关闭退化直查、**总等待时长被预算硬约束（既等满、又不超）**、**降级并发闸门满载时快速失败且不触达 DB**（含"上限配 0 = 不封顶"的对照）、**租约丢失被计数且跳过 unlock**
 - `OrderTimeoutScanSchedulerLeaderElectionTest`：**多副本选主**——抢到锁才扫描并释放、抢不到锁**连 DB 查询都不发生**（这是"不再重复扫描"的直接证据）、租约过期时跳过 `unlock()` 且不抛 `IllegalMonitorStateException`、抢锁被中断则放弃本轮。已做变异验证：去掉选主的 `return` 后准确报红
 - `GlobalExceptionHandlerTest`：**HTTP 状态码语义**——未映射路径与未暴露的 actuator 端点返回真实 404（而不是被兜底包成 HTTP 200 + `code 5000`）、方法不支持返回 405 且按 RFC 9110 带 `Allow` 头、未预期异常返回 500、框架级 `ErrorResponse` 沿用其自带状态码；另有**对照组锁定「业务异常仍是 HTTP 200」这条既有约定不被误改**
+- `RedisConfigPasswordNormalizerTest`：**空密码归一化**——`redisson-spring-boot-starter` 把 `spring.data.redis.password` 原样交给 Redisson 且**没有空值守卫**，而 Redisson 判"要不要发 AUTH"看的是 password 是否为 null，于是 `application-prod.yml` 里 `${REDIS_PASSWORD:}` 解析出的**空串**会发出一条 `AUTH ""`，对无密码 Redis 直接报 `ERR Client sent AUTH, but no password is set` 并把启动打挂（dev 因为压根没写这一行而是 null，所以一直没暴露）。用例锁定"空串/纯空格/null 都归一化成 null"，并含**防修过头的对照**——配了真密码必须原样保留；已做变异验证：模拟"无条件清空密码"后该对照组准确报红
 
 > 集成测试使用独立测试库 `ecommerce_test`（自动创建）与 Redis DB15，不污染开发数据；
 > 测试 profile 已禁用 Nacos/Sentinel/RocketMQ，无需额外中间件。
